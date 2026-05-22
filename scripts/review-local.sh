@@ -30,6 +30,11 @@ export CONFIG__GIT_PROVIDER=github
 export CONFIG__MODEL="$MODEL"
 export CONFIG__FALLBACK_MODELS="[\"$MODEL\"]"
 
+# Comment-style guidance (life-graph KB 04d5aebb): constructive, prioritized, explicit, concise.
+REVIEW_STYLE="Prioritize must-fix and should-fix changes; include at most one or two nice-to-have items. State explicitly what to change and how, with concrete example code. Use plain, unambiguous wording; no vague, implicit, or loaded terms. Be explicit and transparent, but concise; do not flood with words."
+export PR_REVIEWER__EXTRA_INSTRUCTIONS="$REVIEW_STYLE"
+export PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS="$REVIEW_STYLE"
+
 if [ "$CMD" = "improve" ]; then
     export PR_CODE_SUGGESTIONS__COMMITABLE_CODE_SUGGESTIONS=true
 fi
