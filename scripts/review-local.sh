@@ -2,19 +2,31 @@
 # Runs PR-Agent review/improve through the local Claude Code CLI handler (Max subscription, no API key).
 set -euo pipefail
 
-PR_URL="${1:-}"
-CMD="${2:-review}"
-PREVIEW_FLAG="${3:-}"
 MODEL="${MODEL:-claude_cli/sonnet}"
 
-if [ -z "$PR_URL" ]; then
+# Local self-review mode: diff HEAD vs a target branch with PR-Agent's LocalGitProvider.
+# No PR URL, no GitHub token, never posts — emits structured output to stdout.
+LOCAL_MODE=0
+PREVIEW_FLAG=""
+usage() {
     echo "Usage: $0 <pr-url> [review|improve] [--preview]" >&2
+    echo "       $0 --local [target] [review|improve]   (HEAD vs target, no PR, no post)" >&2
     exit 1
+}
+
+if [ "${1:-}" = "--local" ]; then
+    LOCAL_MODE=1
+    TARGET="${2:-}"
+    CMD="${3:-review}"
+else
+    PR_URL="${1:-}"
+    CMD="${2:-review}"
+    PREVIEW_FLAG="${3:-}"
+    [ -z "$PR_URL" ] && usage
 fi
 
 if [ "$CMD" != "review" ] && [ "$CMD" != "improve" ]; then
-    echo "Usage: $0 <pr-url> [review|improve] [--preview]" >&2
-    exit 1
+    usage
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,8 +37,32 @@ if [ ! -x "$PY" ]; then
     exit 1
 fi
 
-export GITHUB__USER_TOKEN="$(gh auth token)"
-export CONFIG__GIT_PROVIDER=github
+if [ "$LOCAL_MODE" = "1" ]; then
+    # Resolve target: explicit arg, else master, else main.
+    if [ -z "$TARGET" ]; then
+        if git show-ref --verify --quiet refs/heads/master; then TARGET=master
+        elif git show-ref --verify --quiet refs/heads/main; then TARGET=main
+        else echo "No target branch given and neither 'master' nor 'main' exists locally." >&2; exit 1; fi
+    fi
+    if ! git show-ref --verify --quiet "refs/heads/$TARGET"; then
+        echo "Branch '$TARGET' does not exist locally. Fetch it first (e.g. git fetch origin $TARGET:$TARGET)." >&2
+        exit 1
+    fi
+    # LocalGitProvider requires a clean working tree.
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "Working tree is not clean. Commit or stash changes before self-review." >&2
+        exit 1
+    fi
+    if ! command -v claude >/dev/null 2>&1; then
+        echo "The 'claude' CLI is not on PATH. Install/authenticate it before self-review." >&2
+        exit 1
+    fi
+    export CONFIG__GIT_PROVIDER=local
+    PR_URL="$TARGET"   # LocalGitProvider reads the pr_url argument as the target branch name
+else
+    export GITHUB__USER_TOKEN="$(gh auth token)"
+    export CONFIG__GIT_PROVIDER=github
+fi
 export CONFIG__MODEL="$MODEL"
 export CONFIG__FALLBACK_MODELS="[\"$MODEL\"]"
 
@@ -59,13 +95,22 @@ if [ -f "$HOME/.config/pr-agent/conventions.md" ]; then
     PERSONAL_CONVENTIONS_LOADED=yes
 fi
 
-if [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$OWNER" ] && [ -n "$REPO" ]; then
+if [ "$LOCAL_MODE" = "1" ]; then
+    # Local mode: read the repo's on-disk AGENTS.md (no GitHub API — there is no owner/repo).
+    TOPLEVEL="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$TOPLEVEL" ] && [ -f "$TOPLEVEL/AGENTS.md" ]; then
+        CONV+="## repo AGENTS.md"$'\n'
+        CONV+="$(head -c 6000 "$TOPLEVEL/AGENTS.md")"
+        CONV+=$'\n'
+        REPO_AGENTS_LOADED=file
+    fi
+elif [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$OWNER" ] && [ -n "$REPO" ]; then
     REPO_AGENTS_CONTENT="$(gh api -H "Accept: application/vnd.github.raw" "repos/$OWNER/$REPO/contents/AGENTS.md" 2>/dev/null || true)"
     if [ -n "$REPO_AGENTS_CONTENT" ]; then
         CONV+="## $REPO AGENTS.md"$'\n'
         CONV+="$(printf '%s' "$REPO_AGENTS_CONTENT" | head -c 6000)"
         CONV+=$'\n'
-        REPO_AGENTS_LOADED=yes
+        REPO_AGENTS_LOADED=api
     fi
 
     if [ "${PRAGENT_INCLUDE_CLAUDE_MD:-0}" = "1" ]; then
@@ -91,11 +136,14 @@ export PR_REVIEWER__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
 export PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
 echo "conventions: personal=$PERSONAL_CONVENTIONS_LOADED repo-AGENTS=$REPO_AGENTS_LOADED claude-md=$CLAUDE_MD_LOADED" >&2
 
-if [ "$CMD" = "improve" ]; then
+# Committable suggestions only make sense when posting to a real PR (github mode).
+# Local self-review wants the structured code_suggestions JSON instead.
+if [ "$CMD" = "improve" ] && [ "$LOCAL_MODE" = "0" ]; then
     export PR_CODE_SUGGESTIONS__COMMITABLE_CODE_SUGGESTIONS=true
 fi
 
-if [ "$PREVIEW_FLAG" = "--preview" ]; then
+# Local mode and --preview both produce structured stdout and never post.
+if [ "$LOCAL_MODE" = "1" ] || [ "$PREVIEW_FLAG" = "--preview" ]; then
     export CONFIG__PUBLISH_OUTPUT=false
     exec "$PY" - "$PR_URL" "$CMD" <<'PY'
 import asyncio
@@ -115,7 +163,7 @@ async def main() -> None:
 
     settings = get_settings()
     settings.set("CONFIG.PUBLISH_OUTPUT", False)
-    settings.set("CONFIG.GIT_PROVIDER", "github")
+    settings.set("CONFIG.GIT_PROVIDER", os.environ.get("CONFIG__GIT_PROVIDER", "github"))
     settings.set("CONFIG.MODEL", os.environ["CONFIG__MODEL"])
 
     if cmd == "review":
@@ -125,7 +173,10 @@ async def main() -> None:
     elif cmd == "improve":
         tool = PRCodeSuggestions(pr_url, ai_handler=get_ai_handler())
         await tool.run()
-        print(json.dumps(settings.get("data", {}), indent=2, default=str))
+        # With publish_output=False the tool clobbers settings.data to {"artifact": <md>};
+        # the structured suggestions (with score/label per item) live on tool.data.
+        print(json.dumps(getattr(tool, "data", None) or {"code_suggestions": []},
+                         indent=2, default=str))
     else:
         raise SystemExit(f"Unsupported command: {cmd}")
 
