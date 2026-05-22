@@ -1,6 +1,7 @@
 # Claude ⇄ PR-Agent Pre-PR Self-Review (MVP — Phase 1)
 
-Status: approved design (2026-05-22). Implementation pending (build in a fresh session).
+Status: implemented (2026-05-22). `scripts/review-local.sh --local <target> [review|improve]`
++ user-scope `/pr-self-review` command.
 
 ## 1. Purpose
 Let Claude review its OWN work before opening a PR: run PR-Agent against the local branch
