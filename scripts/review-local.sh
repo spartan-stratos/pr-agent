@@ -32,8 +32,64 @@ export CONFIG__FALLBACK_MODELS="[\"$MODEL\"]"
 
 # Comment-style guidance (life-graph KB 04d5aebb): constructive, prioritized, explicit, concise.
 REVIEW_STYLE="Prioritize must-fix and should-fix changes; include at most one or two nice-to-have items. State explicitly what to change and how, with concrete example code. Use plain, unambiguous wording; no vague, implicit, or loaded terms. Be explicit and transparent, but concise; do not flood with words."
-export PR_REVIEWER__EXTRA_INSTRUCTIONS="$REVIEW_STYLE"
-export PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS="$REVIEW_STYLE"
+
+REPO_PATH=""
+OWNER=""
+REPO=""
+if [[ "$PR_URL" == https://github.com/*/pull/* ]]; then
+    REPO_PATH="${PR_URL#https://github.com/}"
+    REPO_PATH="${REPO_PATH%%/pull/*}"
+    OWNER="${REPO_PATH%%/*}"
+    if [ "$OWNER" != "$REPO_PATH" ]; then
+        REPO="${REPO_PATH#*/}"
+    else
+        OWNER=""
+    fi
+fi
+
+PERSONAL_CONVENTIONS_LOADED=no
+REPO_AGENTS_LOADED=no
+CLAUDE_MD_LOADED=no
+CONV=""
+
+if [ -f "$HOME/.config/pr-agent/conventions.md" ]; then
+    CONV+=$'## Personal conventions\n'
+    CONV+="$(cat "$HOME/.config/pr-agent/conventions.md")"
+    CONV+=$'\n'
+    PERSONAL_CONVENTIONS_LOADED=yes
+fi
+
+if [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$OWNER" ] && [ -n "$REPO" ]; then
+    REPO_AGENTS_CONTENT="$(gh api -H "Accept: application/vnd.github.raw" "repos/$OWNER/$REPO/contents/AGENTS.md" 2>/dev/null || true)"
+    if [ -n "$REPO_AGENTS_CONTENT" ]; then
+        CONV+="## $REPO AGENTS.md"$'\n'
+        CONV+="$(printf '%s' "$REPO_AGENTS_CONTENT" | head -c 6000)"
+        CONV+=$'\n'
+        REPO_AGENTS_LOADED=yes
+    fi
+
+    if [ "${PRAGENT_INCLUDE_CLAUDE_MD:-0}" = "1" ]; then
+        REPO_CLAUDE_CONTENT="$(gh api -H "Accept: application/vnd.github.raw" "repos/$OWNER/$REPO/contents/CLAUDE.md" 2>/dev/null || true)"
+        if [ -n "$REPO_CLAUDE_CONTENT" ]; then
+            CONV+="## $REPO CLAUDE.md"$'\n'
+            CONV+="$(printf '%s' "$REPO_CLAUDE_CONTENT" | head -c 6000)"
+            CONV+=$'\n'
+            CLAUDE_MD_LOADED=yes
+        fi
+    fi
+fi
+
+CONV="$(printf '%s' "$CONV" | head -c 9000)"
+
+EXTRA_INSTRUCTIONS="$REVIEW_STYLE"
+if [ -n "$CONV" ]; then
+    EXTRA_INSTRUCTIONS+=$'\nEnforce these project conventions where the diff touches them; cite the specific rule when you flag a violation:\n'
+    EXTRA_INSTRUCTIONS+="$CONV"
+fi
+
+export PR_REVIEWER__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
+export PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
+echo "conventions: personal=$PERSONAL_CONVENTIONS_LOADED repo-AGENTS=$REPO_AGENTS_LOADED claude-md=$CLAUDE_MD_LOADED" >&2
 
 if [ "$CMD" = "improve" ]; then
     export PR_CODE_SUGGESTIONS__COMMITABLE_CODE_SUGGESTIONS=true
