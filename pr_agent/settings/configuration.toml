@@ -5,6 +5,7 @@
 [config]
 # models
 model="gpt-5.5-2026-04-23"
+# To review via the local Claude Code CLI (Max subscription, no API key), set model="claude_cli/sonnet" and fallback_models=[].
 fallback_models=["gpt-5.4-mini"]
 #model_reasoning="gpt-5.4-mini" # dedicated reasoning model for self-reflection
 #model_weak="gpt-5.4-nano" # optional, a weaker model to use for some easier tasks
@@ -71,6 +72,12 @@ extract_issue_from_branch = true
 # to default if missing). If empty, uses default pattern: first 1-6 digits at start of branch or after a slash,
 # followed by hyphen or end (e.g. feature/1-test, 123-fix). GitHub only; other providers planned for later.
 branch_issue_regex = ""
+
+[claude_cli]
+command = "claude"          # path/name of the Claude Code CLI on PATH
+timeout = 600               # seconds; CLI calls are slower than API
+disallowed_tools = "Bash Edit Write Read Glob Grep WebFetch WebSearch Task NotebookEdit MultiEdit"
+extra_args = []             # extra flags passed verbatim to `claude`
 
 
 [pr_reviewer] # /review #

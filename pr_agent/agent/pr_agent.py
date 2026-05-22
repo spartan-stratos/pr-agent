@@ -46,10 +46,17 @@ command2class = {
 commands = list(command2class.keys())
 
 
+def get_ai_handler() -> partial:
+    model = get_settings().config.get("model", "") or ""
+    if isinstance(model, str) and model.startswith("claude_cli/"):
+        from pr_agent.algo.ai_handlers.claude_cli_ai_handler import ClaudeCliAIHandler
+        return partial(ClaudeCliAIHandler)
+    return partial(LiteLLMAIHandler)
+
 
 class PRAgent:
-    def __init__(self, ai_handler: partial[BaseAiHandler,] = LiteLLMAIHandler):
-        self.ai_handler = ai_handler  # will be initialized in run_action
+    def __init__(self, ai_handler: partial[BaseAiHandler,] = None):
+        self.ai_handler = ai_handler if ai_handler is not None else get_ai_handler()
 
     async def _handle_request(self, pr_url, request, notify=None) -> bool:
         # First, apply repo specific settings if exists
