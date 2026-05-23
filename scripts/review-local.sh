@@ -110,10 +110,40 @@ if [ "$LOCAL_MODE" = "1" ]; then
         done
     fi
 elif [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$OWNER" ] && [ -n "$REPO" ]; then
-    # TTL-cached fetch (scripts/agent-rules.sh): exit 0 + content = present, 3 = absent, 1 = transient.
-    if REPO_AGENTS_CONTENT="$("$ROOT/scripts/agent-rules.sh" "$OWNER" "$REPO" 2>/dev/null)" && [ -n "$REPO_AGENTS_CONTENT" ]; then
+    # Prefer the indexed rules mirror (scripts/index-repo-rules.sh): inject only the rule
+    # domains the PR actually touches (by changed-file path), plus core as a baseline.
+    MIRROR="${PRAGENT_RULES_MIRROR:-$HOME/.claude-library/rules/repos}/${OWNER}__${REPO}"
+    if [ -d "$MIRROR" ]; then
+        DOMAINS=" core "   # always include core; space-padded for word-match dedup
+        addd() { case "$DOMAINS" in *" $1 "*) ;; *) DOMAINS="$DOMAINS$1 ";; esac; }
+        # gh pr view paginates internally; fine for typical PRs (well under hundreds of files).
+        while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+                *.kt) addd backend-micronaut; addd shared-backend;;
+                *.sql) addd database;;
+                *.tf|*.hcl|*.tfvars) addd infrastructure;;
+                *.tsx|*.ts|*.jsx|*.js|*.css|*.scss) addd frontend-react;;
+            esac
+            case "$f" in
+                *docker-compose*|*.github/workflows/*) addd infrastructure;;
+            esac
+        done <<< "$(gh pr view "$PR_URL" --json files --jq '.files[].path' 2>/dev/null || true)"
+        for d in $DOMAINS; do
+            if [ -d "$MIRROR/$d" ]; then
+                # bash substring, not `| head` — piping to head trips pipefail with SIGPIPE.
+                CHUNK="$(cat "$MIRROR/$d"/*.md 2>/dev/null || true)"
+                if [ -n "$CHUNK" ]; then
+                    CONV+="## $d rules"$'\n'"${CHUNK:0:3000}"$'\n'
+                    REPO_AGENTS_LOADED=mirror
+                fi
+            fi
+        done
+    fi
+    # No mirror (or it yielded nothing) — fall back to the TTL-cached single-file fetch.
+    if [ "$REPO_AGENTS_LOADED" = "no" ] && REPO_AGENTS_CONTENT="$("$ROOT/scripts/agent-rules.sh" "$OWNER" "$REPO" 2>/dev/null)" && [ -n "$REPO_AGENTS_CONTENT" ]; then
         CONV+="## $REPO AGENTS.md"$'\n'
-        CONV+="$(printf '%s' "$REPO_AGENTS_CONTENT" | head -c 6000)"
+        CONV+="${REPO_AGENTS_CONTENT:0:6000}"
         CONV+=$'\n'
         REPO_AGENTS_LOADED=api
     fi
@@ -121,14 +151,14 @@ elif [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$OWNER" ] && [ -n "$RE
     if [ "${PRAGENT_INCLUDE_CLAUDE_MD:-0}" = "1" ]; then
         if REPO_CLAUDE_CONTENT="$(gh api -H "Accept: application/vnd.github.raw" "repos/$OWNER/$REPO/contents/CLAUDE.md" 2>/dev/null)" && [ -n "$REPO_CLAUDE_CONTENT" ]; then
             CONV+="## $REPO CLAUDE.md"$'\n'
-            CONV+="$(printf '%s' "$REPO_CLAUDE_CONTENT" | head -c 6000)"
+            CONV+="${REPO_CLAUDE_CONTENT:0:6000}"
             CONV+=$'\n'
             CLAUDE_MD_LOADED=yes
         fi
     fi
 fi
 
-CONV="$(printf '%s' "$CONV" | head -c 9000)"
+CONV="${CONV:0:9000}"
 
 EXTRA_INSTRUCTIONS="$REVIEW_STYLE"
 if [ -n "$CONV" ]; then
