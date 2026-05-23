@@ -219,5 +219,18 @@ asyncio.run(main())
 PY
 else
     export CONFIG__PUBLISH_OUTPUT=true
+    if [ "$CMD" = "improve" ] && [ "$LOCAL_MODE" = "0" ]; then
+        # Capture stderr so we can recover suggestions PR-Agent dropped when their target
+        # line falls outside the diff hunks (move/refactor PRs) and post them as one comment.
+        ERRLOG="$(mktemp)"
+        set +e
+        # PR-Agent's loguru sink is stdout, so capture stdout (merge stderr in too).
+        "$PY" -m pr_agent.cli --pr_url "$PR_URL" "$CMD" > >(tee "$ERRLOG") 2>&1
+        rc=$?
+        set -e
+        "$PY" "$ROOT/scripts/post-dropped-suggestions.py" "$PR_URL" "$ERRLOG" || true
+        rm -f "$ERRLOG"
+        exit $rc
+    fi
     exec "$PY" -m pr_agent.cli --pr_url "$PR_URL" "$CMD"
 fi
