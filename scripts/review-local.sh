@@ -105,8 +105,9 @@ if [ "$LOCAL_MODE" = "1" ]; then
         REPO_AGENTS_LOADED=file
     fi
 elif [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$OWNER" ] && [ -n "$REPO" ]; then
-    REPO_AGENTS_CONTENT="$(gh api -H "Accept: application/vnd.github.raw" "repos/$OWNER/$REPO/contents/AGENTS.md" 2>/dev/null || true)"
-    if [ -n "$REPO_AGENTS_CONTENT" ]; then
+    # Guard on the gh exit code, NOT on non-empty output: on a 404 gh prints the
+    # error JSON body to stdout and exits 1, so `|| true` would inject "Not Found" as conventions.
+    if REPO_AGENTS_CONTENT="$(gh api -H "Accept: application/vnd.github.raw" "repos/$OWNER/$REPO/contents/AGENTS.md" 2>/dev/null)" && [ -n "$REPO_AGENTS_CONTENT" ]; then
         CONV+="## $REPO AGENTS.md"$'\n'
         CONV+="$(printf '%s' "$REPO_AGENTS_CONTENT" | head -c 6000)"
         CONV+=$'\n'
@@ -114,8 +115,7 @@ elif [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$OWNER" ] && [ -n "$RE
     fi
 
     if [ "${PRAGENT_INCLUDE_CLAUDE_MD:-0}" = "1" ]; then
-        REPO_CLAUDE_CONTENT="$(gh api -H "Accept: application/vnd.github.raw" "repos/$OWNER/$REPO/contents/CLAUDE.md" 2>/dev/null || true)"
-        if [ -n "$REPO_CLAUDE_CONTENT" ]; then
+        if REPO_CLAUDE_CONTENT="$(gh api -H "Accept: application/vnd.github.raw" "repos/$OWNER/$REPO/contents/CLAUDE.md" 2>/dev/null)" && [ -n "$REPO_CLAUDE_CONTENT" ]; then
             CONV+="## $REPO CLAUDE.md"$'\n'
             CONV+="$(printf '%s' "$REPO_CLAUDE_CONTENT" | head -c 6000)"
             CONV+=$'\n'
