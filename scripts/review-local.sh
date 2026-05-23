@@ -96,13 +96,18 @@ if [ -f "$HOME/.config/pr-agent/conventions.md" ]; then
 fi
 
 if [ "$LOCAL_MODE" = "1" ]; then
-    # Local mode: read the repo's on-disk AGENTS.md (no GitHub API — there is no owner/repo).
+    # Local mode: read on-disk rules (no GitHub API). First hit wins: AGENTS.md, then .claude/CLAUDE.md.
     TOPLEVEL="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-    if [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$TOPLEVEL" ] && [ -f "$TOPLEVEL/AGENTS.md" ]; then
-        CONV+="## repo AGENTS.md"$'\n'
-        CONV+="$(head -c 6000 "$TOPLEVEL/AGENTS.md")"
-        CONV+=$'\n'
-        REPO_AGENTS_LOADED=file
+    if [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$TOPLEVEL" ]; then
+        for rel in AGENTS.md .claude/CLAUDE.md; do
+            if [ -f "$TOPLEVEL/$rel" ]; then
+                CONV+="## repo $rel"$'\n'
+                CONV+="$(head -c 6000 "$TOPLEVEL/$rel")"
+                CONV+=$'\n'
+                REPO_AGENTS_LOADED=file
+                break
+            fi
+        done
     fi
 elif [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$OWNER" ] && [ -n "$REPO" ]; then
     # TTL-cached fetch (scripts/agent-rules.sh): exit 0 + content = present, 3 = absent, 1 = transient.
