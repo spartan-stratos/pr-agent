@@ -224,9 +224,15 @@ else
         # line falls outside the diff hunks (move/refactor PRs) and post them as one comment.
         ERRLOG="$(mktemp)"
         set +e
-        # PR-Agent's loguru sink is stdout, so capture stdout (merge stderr in too).
-        "$PY" -m pr_agent.cli --pr_url "$PR_URL" "$CMD" > >(tee "$ERRLOG") 2>&1
-        rc=$?
+        # loguru sink is stdout. Capture the raw run for recovery, but hide the alarming
+        # "couldn't attach inline" ERROR/INFO lines from the console — those suggestions
+        # target lines outside the diff (e.g. pure renames, which have no hunks at all) and
+        # are re-posted as a single PR comment below, so they are not actually lost.
+        "$PY" -m pr_agent.cli --pr_url "$PR_URL" "$CMD" 2>&1 \
+            | tee "$ERRLOG" \
+            | grep -av -e "Failed to publish invalid comment as a single line comment" \
+                       -e "Initially failed to publish inline comments as committable"
+        rc=${PIPESTATUS[0]}
         set -e
         "$PY" "$ROOT/scripts/post-dropped-suggestions.py" "$PR_URL" "$ERRLOG" || true
         rm -f "$ERRLOG"
