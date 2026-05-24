@@ -63,13 +63,17 @@ def get_settings(use_context=False):
 # Add local configuration from pyproject.toml of the project being reviewed
 def _find_repository_root() -> Optional[Path]:
     """
-    Identify project root directory by recursively searching for the .git directory in the parent directories.
+    Identify project root directory by recursively searching parent directories for .git
+    (a directory in normal clones, a file in worktrees/submodules).
     """
     cwd = Path.cwd().resolve()
     no_way_up = False
     while not no_way_up:
         no_way_up = cwd == cwd.parent
-        if (cwd / ".git").is_dir():
+        git_path = cwd / ".git"
+        # .git is a file (not a dir) in worktrees and submodules — it holds a
+        # `gitdir:` pointer that GitPython's Repo() resolves downstream.
+        if git_path.is_dir() or git_path.is_file():
             return cwd
         cwd = cwd.parent
     return None
