@@ -67,7 +67,7 @@ export CONFIG__MODEL="$MODEL"
 export CONFIG__FALLBACK_MODELS="[\"$MODEL\"]"
 
 # Comment-style guidance (life-graph KB 04d5aebb): constructive, prioritized, explicit, concise.
-REVIEW_STYLE="Prioritize must-fix and should-fix changes; include at most one or two nice-to-have items. State explicitly what to change and how, with concrete example code. Use plain, unambiguous wording; no vague, implicit, or loaded terms. Be explicit and transparent, but concise; do not flood with words."
+REVIEW_STYLE="Prioritize must-fix and should-fix changes; include at most one or two nice-to-have items. State explicitly what to change and how, with concrete example code. Use plain, unambiguous wording; no vague, implicit, or loaded terms. Be explicit and transparent, but concise; do not flood with words. When a suggestion asserts a specific library/framework API exists or behaves a certain way (e.g. an Exposed DSL overload, a Micronaut annotation, a Kotlin stdlib function, a React hook signature), include a reference URL to the official docs or source of the current version (e.g. JetBrains/Exposed wiki or GitHub source, Micronaut guide, kotlinlang.org). If you cannot find a current authoritative reference, phrase the claim as 'verify' rather than 'use' — do not invent APIs."
 
 REPO_PATH=""
 OWNER=""
