@@ -67,7 +67,7 @@ export CONFIG__MODEL="$MODEL"
 export CONFIG__FALLBACK_MODELS="[\"$MODEL\"]"
 
 # Comment-style guidance (life-graph KB 04d5aebb): constructive, prioritized, explicit, concise.
-REVIEW_STYLE="Prioritize must-fix and should-fix changes; include at most one or two nice-to-have items. State explicitly what to change and how, with concrete example code. Use plain, unambiguous wording; no vague, implicit, or loaded terms. Be explicit and transparent, but concise; do not flood with words. When a suggestion asserts a specific library/framework API exists or behaves a certain way (e.g. an Exposed DSL overload, a Micronaut annotation, a Kotlin stdlib function, a React hook signature), include a reference URL to the official docs or source of the current version (e.g. JetBrains/Exposed wiki or GitHub source, Micronaut guide, kotlinlang.org). If you cannot find a current authoritative reference, phrase the claim as 'verify' rather than 'use' — do not invent APIs."
+REVIEW_STYLE="Prioritize must-fix and should-fix changes; include at most one or two nice-to-have items. State explicitly what to change and how, with concrete example code. Use plain, unambiguous wording; no vague, implicit, or loaded terms. Be explicit and transparent, but concise; do not flood with words. When a suggestion asserts a specific library/framework API exists or behaves a certain way (e.g. an Exposed DSL overload, a Micronaut annotation, a Kotlin stdlib function, a React hook signature), include a reference URL to the official docs or source of the current version (e.g. JetBrains/Exposed wiki or GitHub source, Micronaut guide, kotlinlang.org). If you cannot find a current authoritative reference, phrase the claim as 'verify' rather than 'use' — do not invent APIs. Every finding about a TYPE, STATE, or TIMING property of the code must include AT LEAST ONE of: (a) a file:line citation from the diff or repo that proves the precondition (e.g. 'type allows null per api/foo.ts:42'); (b) a documentation URL for the library behaviour claimed; (c) the loaded rule path that the diff violates. If none of these is available, phrase the finding as a question ('Is X nullable here?') instead of an assertion, or omit it. Never make a definitive claim that is actually a guess — guesses are noise."
 
 REPO_PATH=""
 OWNER=""
@@ -269,6 +269,7 @@ else
         rc=${PIPESTATUS[0]}
         set -e
         "$PY" "$ROOT/scripts/post-dropped-suggestions.py" "$PR_URL" "$ERRLOG" || true
+        "$ROOT/scripts/suppress.sh" post-improve --pr-url "$PR_URL" || true
         rm -f "$ERRLOG"
         exit $rc
     fi
