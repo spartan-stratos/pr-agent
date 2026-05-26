@@ -86,6 +86,8 @@ fi
 PERSONAL_CONVENTIONS_LOADED=no
 REPO_AGENTS_LOADED=no
 CLAUDE_MD_LOADED=no
+PATTERNS_LOADED=0
+STACKS_DISPLAY=none
 CONV=""
 
 if [ -f "$HOME/.config/pr-agent/conventions.md" ]; then
@@ -110,37 +112,42 @@ if [ "$LOCAL_MODE" = "1" ]; then
         done
     fi
 elif [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$OWNER" ] && [ -n "$REPO" ]; then
-    # Prefer the indexed rules mirror (scripts/index-repo-rules.sh): inject only the rule
-    # domains the PR actually touches (by changed-file path), plus core as a baseline.
-    MIRROR="${PRAGENT_RULES_MIRROR:-$HOME/.claude-library/rules/repos}/${OWNER}__${REPO}"
-    if [ -d "$MIRROR" ]; then
-        DOMAINS=" core "   # always include core; space-padded for word-match dedup
-        addd() { case "$DOMAINS" in *" $1 "*) ;; *) DOMAINS="$DOMAINS$1 ";; esac; }
-        # gh pr view paginates internally; fine for typical PRs (well under hundreds of files).
-        while IFS= read -r f; do
-            [ -z "$f" ] && continue
-            case "$f" in
-                *.kt) addd backend-micronaut; addd shared-backend;;
-                *.sql) addd database;;
-                *.tf|*.hcl|*.tfvars) addd infrastructure;;
-                *.tsx|*.ts|*.jsx|*.js|*.css|*.scss) addd frontend-react;;
-            esac
-            case "$f" in
-                *docker-compose*|*.github/workflows/*) addd infrastructure;;
-            esac
-        done <<< "$(gh pr view "$PR_URL" --json files --jq '.files[].path' 2>/dev/null || true)"
-        for d in $DOMAINS; do
-            if [ -d "$MIRROR/$d" ]; then
-                # bash substring, not `| head` — piping to head trips pipefail with SIGPIPE.
-                CHUNK="$(cat "$MIRROR/$d"/*.md 2>/dev/null || true)"
-                if [ -n "$CHUNK" ]; then
-                    CONV+="## $d rules"$'\n'"${CHUNK:0:3000}"$'\n'
-                    REPO_AGENTS_LOADED=mirror
-                fi
+    STACKS_ROOT="${PRAGENT_STACKS_ROOT:-$HOME/.claude-library/rules/stacks}"
+    REPO_CACHE_ROOT="${PRAGENT_REPO_CACHE_ROOT:-$HOME/.claude/cache/stacks-from}"
+    REPO_CACHE="$REPO_CACHE_ROOT/${OWNER}__${REPO}"
+
+    # Resolve which stacks apply by piping the PR's changed files into stacks-resolve.sh.
+    STACKS="$(gh pr view "$PR_URL" --json files --jq '.files[].path' 2>/dev/null \
+              | "$ROOT/scripts/stacks-resolve.sh" 2>/dev/null \
+              || echo "core")"
+    STACKS_DISPLAY="$(printf '%s\n' "$STACKS" | tr ' ' ',' | sed 's/,,*/,/g; s/^,//; s/,$//')"
+    [ -n "$STACKS_DISPLAY" ] || STACKS_DISPLAY="none"
+
+    # Auto-index this repo into the per-repo cache (best-effort, never fail the review).
+    "$ROOT/scripts/auto-index-repo.sh" "$OWNER" "$REPO" >/dev/null 2>&1 || true
+
+    for stack in $STACKS; do
+        APPENDED_THIS_STACK=no
+        # Tier 1: curated stack rules.
+        if [ -d "$STACKS_ROOT/$stack" ]; then
+            CHUNK="$(cat "$STACKS_ROOT/$stack"/*.md 2>/dev/null || true)"
+            if [ -n "$CHUNK" ]; then
+                CONV+="## $stack rules (curated)"$'\n'"${CHUNK:0:3000}"$'\n'
+                REPO_AGENTS_LOADED=stacks
+                APPENDED_THIS_STACK=yes
             fi
-        done
-    fi
-    # No mirror (or it yielded nothing) — fall back to the TTL-cached single-file fetch.
+        fi
+        # Tier 2: per-repo cache from auto-index, only when curated did not have it.
+        if [ "$APPENDED_THIS_STACK" = "no" ] && [ -d "$REPO_CACHE/$stack" ]; then
+            CHUNK="$(cat "$REPO_CACHE/$stack"/*.md 2>/dev/null || true)"
+            if [ -n "$CHUNK" ]; then
+                CONV+="## $stack rules (${OWNER}/${REPO} cache)"$'\n'"${CHUNK:0:3000}"$'\n'
+                REPO_AGENTS_LOADED=cache
+            fi
+        fi
+    done
+
+    # Tier 3: nothing landed at all — fall back to root AGENTS.md fetch.
     if [ "$REPO_AGENTS_LOADED" = "no" ] && REPO_AGENTS_CONTENT="$("$ROOT/scripts/agent-rules.sh" "$OWNER" "$REPO" 2>/dev/null)" && [ -n "$REPO_AGENTS_CONTENT" ]; then
         CONV+="## $REPO AGENTS.md"$'\n'
         CONV+="${REPO_AGENTS_CONTENT:0:6000}"
@@ -148,14 +155,41 @@ elif [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$OWNER" ] && [ -n "$RE
         REPO_AGENTS_LOADED=api
     fi
 
-    if [ "${PRAGENT_INCLUDE_CLAUDE_MD:-0}" = "1" ]; then
-        if REPO_CLAUDE_CONTENT="$(gh api -H "Accept: application/vnd.github.raw" "repos/$OWNER/$REPO/contents/CLAUDE.md" 2>/dev/null)" && [ -n "$REPO_CLAUDE_CONTENT" ]; then
-            CONV+="## $REPO CLAUDE.md"$'\n'
-            CONV+="${REPO_CLAUDE_CONTENT:0:6000}"
-            CONV+=$'\n'
-            CLAUDE_MD_LOADED=yes
-        fi
+    # Patterns layer (trigger-matched, opt-in per file). Stdin is the PR diff so triggers can match
+    # against actual changed-line content, not just file paths.
+    PATTERNS_LOADED=0
+    PATTERN_INPUT="$(gh pr diff "$PR_URL" 2>/dev/null || true)"
+    if [ -n "$PATTERN_INPUT" ] && [ -n "$STACKS" ]; then
+        while IFS= read -r pfile; do
+            [ -z "$pfile" ] && continue
+            [ ! -f "$pfile" ] && continue
+            CHUNK="$(cat "$pfile" 2>/dev/null || true)"
+            if [ -n "$CHUNK" ]; then
+                pname="$(basename "$pfile" .md)"
+                CONV+="## pattern: $pname"$'\n'"${CHUNK:0:2000}"$'\n'
+                PATTERNS_LOADED=$((PATTERNS_LOADED + 1))
+            fi
+        done < <(printf '%s\n' "$PATTERN_INPUT" | "$ROOT/scripts/patterns-resolve.sh" $STACKS 2>/dev/null)
     fi
+else
+    STACKS_DISPLAY="none"
+    PATTERNS_LOADED=0
+fi
+
+if [ "${PRAGENT_INCLUDE_CLAUDE_MD:-0}" = "1" ] && [ -n "$OWNER" ] && [ -n "$REPO" ]; then
+    if REPO_CLAUDE_CONTENT="$(gh api -H "Accept: application/vnd.github.raw" "repos/$OWNER/$REPO/contents/CLAUDE.md" 2>/dev/null)" && [ -n "$REPO_CLAUDE_CONTENT" ]; then
+        CONV+="## $REPO CLAUDE.md"$'\n'
+        CONV+="${REPO_CLAUDE_CONTENT:0:6000}"
+        CONV+=$'\n'
+        CLAUDE_MD_LOADED=yes
+    fi
+fi
+
+# Orchestrator-side extension point: callers can append retrieved knowledge (e.g. life-graph)
+# via this env var before the slab is truncated.
+if [ -n "${PRAGENT_EXTRA_RULES_APPEND:-}" ]; then
+    CONV+="## additional retrieved context"$'\n'
+    CONV+="$PRAGENT_EXTRA_RULES_APPEND"$'\n'
 fi
 
 CONV="${CONV:0:9000}"
@@ -168,7 +202,7 @@ fi
 
 export PR_REVIEWER__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
 export PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
-echo "conventions: personal=$PERSONAL_CONVENTIONS_LOADED repo-AGENTS=$REPO_AGENTS_LOADED claude-md=$CLAUDE_MD_LOADED" >&2
+echo "conventions: personal=$PERSONAL_CONVENTIONS_LOADED stacks=$STACKS_DISPLAY patterns=$PATTERNS_LOADED repo-AGENTS=$REPO_AGENTS_LOADED claude-md=$CLAUDE_MD_LOADED" >&2
 
 # Committable suggestions only make sense when posting to a real PR (github mode).
 # Local self-review wants the structured code_suggestions JSON instead.
