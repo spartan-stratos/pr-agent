@@ -13,7 +13,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.lib.fingerprint import fingerprint
-from scripts.lib.suppress_db import find_rejected, insert, list_rows, purge_older_than, set_status
+from scripts.lib.suppress_db import find_rejected, insert, list_rows, purge_older_than, set_status, stats
 
 
 SUGGESTION_BLOCK = re.compile(r"```suggestion[^\n]*\n(.*?)```", re.DOTALL)
@@ -88,7 +88,7 @@ def post_improve(pr_url: str) -> int:
         if not file_path:
             continue
 
-        if find_rejected(repo, file_path, suggestion_fp):
+        if find_rejected(repo, file_path, suggestion_fp, reviewer="pr-agent"):
             gh_api(f"repos/{owner}/{repo_name}/pulls/comments/{comment['id']}", method="DELETE")
             suppressed += 1
             print(
@@ -102,6 +102,7 @@ def post_improve(pr_url: str) -> int:
             file_path,
             suggestion_fp,
             first_non_empty_line(comment.get("body") or ""),
+            reviewer="pr-agent",
             source_pr=pr_url,
             source_comment_url=comment.get("html_url"),
             status="pending",
@@ -113,8 +114,35 @@ def post_improve(pr_url: str) -> int:
 
 
 def handle_list(args: argparse.Namespace) -> int:
-    rows = list_rows(repo=args.repo, status=args.status, limit=args.limit)
+    rows = list_rows(repo=args.repo, status=args.status, reviewer=args.reviewer, limit=args.limit)
     print(json.dumps([dict(row) for row in rows], indent=2))
+    return 0
+
+
+def format_hit_rate(accepted: int, rejected: int) -> str:
+    denominator = accepted + rejected
+    if denominator == 0:
+        return "n/a"
+    return f"{(accepted / denominator) * 100:.1f}%"
+
+
+def handle_stats(args: argparse.Namespace) -> int:
+    reviewer_stats = stats(repo=args.repo)
+    print("| reviewer | accepted | rejected | pending | unclear | total | hit_rate |")
+    print("|---|---|---|---|---|---|---|")
+    for reviewer in sorted(reviewer_stats):
+        row = reviewer_stats[reviewer]
+        print(
+            "| {reviewer} | {accepted} | {rejected} | {pending} | {unclear} | {total} | {hit_rate} |".format(
+                reviewer=reviewer,
+                accepted=row["accepted"],
+                rejected=row["rejected"],
+                pending=row["pending"],
+                unclear=row["unclear"],
+                total=row["total"],
+                hit_rate=format_hit_rate(row["accepted"], row["rejected"]),
+            )
+        )
     return 0
 
 
@@ -141,8 +169,13 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser = sub.add_parser("list")
     list_parser.add_argument("--repo")
     list_parser.add_argument("--status")
+    list_parser.add_argument("--reviewer")
     list_parser.add_argument("--limit", type=int, default=200)
     list_parser.set_defaults(func=handle_list)
+
+    stats_parser = sub.add_parser("stats")
+    stats_parser.add_argument("--repo")
+    stats_parser.set_defaults(func=handle_stats)
 
     reject_parser = sub.add_parser("reject")
     reject_parser.add_argument("id", type=int)

@@ -6,6 +6,7 @@ import json
 import re
 import subprocess
 import sys
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,9 @@ from scripts.lib.fingerprint import fingerprint
 from scripts.lib.suppress_db import insert, list_rows, set_status
 
 
+KNOWN_REVIEWERS = {
+    "copilot-pull-request-reviewer": "copilot",
+}
 SUGGESTION_BLOCK = re.compile(r"```suggestion[^\n]*\n(.*?)```", re.DOTALL)
 PR_URL_RE = re.compile(r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)(?:/.*)?$")
 REJECTED_MARKERS = (
@@ -51,7 +55,10 @@ def gh_api(path: str) -> Any:
 
 
 def gh_login() -> str:
-    return str(gh_api("user")["login"])
+    proc = subprocess.run(["gh", "api", "user", "--jq", ".login"], capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise SystemExit(proc.stderr.strip() or proc.stdout.strip() or "gh api user failed")
+    return proc.stdout.strip()
 
 
 def extract_codes(comment: dict[str, Any]) -> tuple[str, str]:
@@ -79,16 +86,22 @@ def classify_reply(body: str) -> str:
     return "unclear"
 
 
+def is_suggestion_shaped(comment: dict[str, Any]) -> bool:
+    body = comment.get("body") or ""
+    return "```suggestion" in body or bool(comment.get("diff_hunk"))
+
+
 def upsert_status(
     repo: str,
     file_path: str,
     suggestion_fp: str,
     one_sentence: str,
     status: str,
+    reviewer: str,
     pr_url: str,
     comment_url: str | None,
 ) -> str:
-    existing = list_rows(repo=repo, limit=1000)
+    existing = list_rows(repo=repo, reviewer=reviewer, limit=1000)
     for row in existing:
         if row["file_path"] == file_path and row["fingerprint"] == suggestion_fp:
             if STATUS_PRIORITY[status] > STATUS_PRIORITY[row["status"]]:
@@ -101,6 +114,7 @@ def upsert_status(
         file_path,
         suggestion_fp,
         one_sentence,
+        reviewer=reviewer,
         source_pr=pr_url,
         source_comment_url=comment_url,
         status=status,
@@ -111,6 +125,9 @@ def upsert_status(
 def run_import(pr_url: str) -> int:
     owner, repo_name, repo, number = parse_pr_url(pr_url)
     login = gh_login()
+    reviewer_aliases = dict(KNOWN_REVIEWERS)
+    reviewer_aliases[login] = "pr-agent"
+
     comments = gh_api(f"repos/{owner}/{repo_name}/pulls/{number}/comments")
     replies_by_parent: dict[int, list[dict[str, Any]]] = {}
     for comment in comments:
@@ -118,16 +135,24 @@ def run_import(pr_url: str) -> int:
         if parent_id is not None:
             replies_by_parent.setdefault(parent_id, []).append(comment)
 
-    imported = 0
     rejected = 0
     accepted = 0
     unclear = 0
+    per_reviewer: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"imported": 0, "rejected": 0, "accepted": 0, "unclear": 0, "pending": 0}
+    )
 
     for comment in comments:
         if comment.get("in_reply_to_id") is not None:
             continue
-        if comment.get("user", {}).get("login") != login:
-            continue
+
+        author_login = comment.get("user", {}).get("login")
+        reviewer = reviewer_aliases.get(author_login)
+        if reviewer is None:
+            if author_login == login and is_suggestion_shaped(comment):
+                reviewer = "pr-agent"
+            else:
+                continue
 
         existing_code, improved_code = extract_codes(comment)
         suggestion_fp = fingerprint(existing_code, improved_code)
@@ -148,10 +173,12 @@ def run_import(pr_url: str) -> int:
             suggestion_fp,
             first_non_empty_line(comment.get("body") or ""),
             status,
+            reviewer,
             pr_url,
             comment.get("html_url"),
         )
-        imported += 1
+        per_reviewer[reviewer]["imported"] += 1
+        per_reviewer[reviewer][final_status] += 1
         if final_status == "rejected":
             rejected += 1
         elif final_status == "accepted":
@@ -159,7 +186,13 @@ def run_import(pr_url: str) -> int:
         elif final_status == "unclear":
             unclear += 1
 
-    print(f"imported: {imported} comments, {rejected} rejected, {accepted} accepted, {unclear} unclear")
+    print(f"imported: {len(per_reviewer)} reviewers, {rejected} rejected, {accepted} accepted, {unclear} unclear")
+    for reviewer in sorted(per_reviewer):
+        counts = per_reviewer[reviewer]
+        print(
+            f"  {reviewer}: imported={counts['imported']} pending={counts['pending']} "
+            f"rejected={counts['rejected']} accepted={counts['accepted']} unclear={counts['unclear']}"
+        )
     return 0
 
 
