@@ -18,22 +18,43 @@ from scripts.lib.suppress_db import insert, list_rows, set_status
 
 KNOWN_REVIEWERS = {
     "copilot-pull-request-reviewer": "copilot",
+    "Copilot": "copilot",
+    "github-copilot[bot]": "copilot",
 }
 SUGGESTION_BLOCK = re.compile(r"```suggestion[^\n]*\n(.*?)```", re.DOTALL)
 PR_URL_RE = re.compile(r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)(?:/.*)?$")
+# Strong, unambiguous rejection signals only. Avoid generic markers like
+# "chose", "out of scope", "acknowledged the" — they fire on context mentions
+# of adjacent issues, not on the reply's actual verdict.
 REJECTED_MARKERS = (
     "not a bug",
     "by design",
     "intentional",
     "this is correct",
-    "mock",
     "won't fix",
     "wontfix",
     "false positive",
     "as designed",
     "working as intended",
+    "disagree",
+    "diverges from",
+    "diverge from",
+    "leaving as is",
+    "leaving as-is",
+    "leave as is",
+    "leave as-is",
+    "framework convention",
+    "established pattern",
 )
-ACCEPTED_MARKERS = ("good catch", "fixed", "thanks", "applied", "done")
+ACCEPTED_MARKERS = (
+    "good catch",
+    "fixed",
+    "thanks",
+    "applied",
+    "done",
+    "addressed",
+    "updated",
+)
 STATUS_PRIORITY = {"pending": 0, "unclear": 1, "accepted": 2, "rejected": 3}
 
 
@@ -104,6 +125,9 @@ def upsert_status(
     existing = list_rows(repo=repo, reviewer=reviewer, limit=1000)
     for row in existing:
         if row["file_path"] == file_path and row["fingerprint"] == suggestion_fp:
+            # Never overwrite a manual decision — humans win over heuristics.
+            if row["decided_by"] == "manual":
+                return row["status"]
             if STATUS_PRIORITY[status] > STATUS_PRIORITY[row["status"]]:
                 set_status(row["id"], status, decided_by="import")
                 return status
