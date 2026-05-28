@@ -517,8 +517,14 @@ class PRCodeSuggestions:
                     get_logger().debug(f"Skipping suggestion {i + 1}, because it is a duplicate: {suggestion}")
                     continue
 
-                if 'const' in suggestion['suggestion_content'] and 'instead' in suggestion[
-                    'suggestion_content'] and 'let' in suggestion['suggestion_content']:
+                # Fallback: some models omit `suggestion_content` and put the rationale inline in
+                # `improved_code` as a code comment. Use `one_sentence_summary` as the surface text
+                # rather than dropping the whole suggestion.
+                if not suggestion.get('suggestion_content'):
+                    suggestion['suggestion_content'] = suggestion.get('one_sentence_summary', '').strip()
+
+                content = suggestion.get('suggestion_content', '')
+                if 'const' in content and 'instead' in content and 'let' in content:
                     get_logger().debug(
                         f"Skipping suggestion {i + 1}, because it uses 'const instead let': {suggestion}")
                     continue
