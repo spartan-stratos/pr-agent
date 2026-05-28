@@ -75,11 +75,12 @@ if [ ! -f "$REVIEW_STYLE_FILE" ]; then
 fi
 REVIEW_STYLE="$(cat "$REVIEW_STYLE_FILE")"
 
-# Self-reflection score threshold (PR-Agent always scores `improve` suggestions on 0-10;
-# default config of 0 disables the filter). 6 drops the low-confidence band without
-# clipping borderline-useful findings. Docs recommend not exceeding 7-8.
-# Override with PRAGENT_SCORE_THRESHOLD=N (0 to disable).
-export PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD="${PRAGENT_SCORE_THRESHOLD:-6}"
+# Self-reflection score threshold (PR-Agent scores every `improve` suggestion 0-10).
+# 8 = "confidence ≥ 80%". Only high-confidence findings reach the PR as inline comments;
+# anything below is dropped after the self-reflection pass. Upstream docs cap recommendation
+# at 7-8 to avoid clipping borderline-useful suggestions — 8 is the strict end of that range.
+# Override with PRAGENT_SCORE_THRESHOLD=N (e.g. 6 for broader recall during pattern learning).
+export PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD="${PRAGENT_SCORE_THRESHOLD:-8}"
 
 REPO_PATH=""
 OWNER=""
