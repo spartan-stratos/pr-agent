@@ -76,11 +76,13 @@ fi
 REVIEW_STYLE="$(cat "$REVIEW_STYLE_FILE")"
 
 # Self-reflection score threshold (PR-Agent scores every `improve` suggestion 0-10).
-# 8 = "confidence ≥ 80%". Only high-confidence findings reach the PR as inline comments;
-# anything below is dropped after the self-reflection pass. Upstream docs cap recommendation
-# at 7-8 to avoid clipping borderline-useful suggestions — 8 is the strict end of that range.
-# Override with PRAGENT_SCORE_THRESHOLD=N (e.g. 6 for broader recall during pattern learning).
-export PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD="${PRAGENT_SCORE_THRESHOLD:-8}"
+# 7 = "≥70% confidence", upstream's recommended high-band ceiling. Empirical: 8 was too
+# strict — observed score-7 findings on PR #502 (UberDriverIdBackfillJob/Test) that were
+# genuine defects with file:line evidence. Self-reflection scoring is also stochastic
+# (varies ±1 between runs), so 7 catches real defects that a 1-point dip would otherwise
+# silently drop.
+# Override with PRAGENT_SCORE_THRESHOLD=N (8 for strict, 0 to disable).
+export PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD="${PRAGENT_SCORE_THRESHOLD:-7}"
 
 REPO_PATH=""
 OWNER=""
