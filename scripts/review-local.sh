@@ -84,6 +84,12 @@ REVIEW_STYLE="$(cat "$REVIEW_STYLE_FILE")"
 # Override with PRAGENT_SCORE_THRESHOLD=N (8 for strict, 0 to disable).
 export PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD="${PRAGENT_SCORE_THRESHOLD:-7}"
 
+# Suppress the "No code suggestions found for the PR." placeholder comment.
+# When the score filter drops everything, posting a placeholder is noise — the
+# absence of comments already signals "no findings". Override with
+# PRAGENT_PUBLISH_NO_SUGGESTIONS=true to restore upstream behavior.
+export PR_CODE_SUGGESTIONS__PUBLISH_OUTPUT_NO_SUGGESTIONS="${PRAGENT_PUBLISH_NO_SUGGESTIONS:-false}"
+
 REPO_PATH=""
 OWNER=""
 REPO=""
