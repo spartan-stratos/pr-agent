@@ -75,6 +75,12 @@ if [ ! -f "$REVIEW_STYLE_FILE" ]; then
 fi
 REVIEW_STYLE="$(cat "$REVIEW_STYLE_FILE")"
 
+# Self-reflection score threshold (PR-Agent always scores `improve` suggestions on 0-10;
+# default config of 0 disables the filter). 6 drops the low-confidence band without
+# clipping borderline-useful findings. Docs recommend not exceeding 7-8.
+# Override with PRAGENT_SCORE_THRESHOLD=N (0 to disable).
+export PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD="${PRAGENT_SCORE_THRESHOLD:-6}"
+
 REPO_PATH=""
 OWNER=""
 REPO=""
@@ -208,7 +214,7 @@ fi
 
 export PR_REVIEWER__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
 export PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
-echo "conventions: personal=$PERSONAL_CONVENTIONS_LOADED stacks=$STACKS_DISPLAY patterns=$PATTERNS_LOADED repo-AGENTS=$REPO_AGENTS_LOADED claude-md=$CLAUDE_MD_LOADED" >&2
+echo "conventions: personal=$PERSONAL_CONVENTIONS_LOADED stacks=$STACKS_DISPLAY patterns=$PATTERNS_LOADED repo-AGENTS=$REPO_AGENTS_LOADED claude-md=$CLAUDE_MD_LOADED score-threshold=$PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD" >&2
 
 # Committable suggestions only make sense when posting to a real PR (github mode).
 # Local self-review wants the structured code_suggestions JSON instead.
