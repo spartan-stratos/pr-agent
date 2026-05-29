@@ -90,6 +90,14 @@ export PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD="${PRAGENT_SCORE_THRESHO
 # PRAGENT_PUBLISH_NO_SUGGESTIONS=true to restore upstream behavior.
 export PR_CODE_SUGGESTIONS__PUBLISH_OUTPUT_NO_SUGGESTIONS="${PRAGENT_PUBLISH_NO_SUGGESTIONS:-false}"
 
+# Suppress the "Generating PR code suggestions / Work in progress ..." progress
+# placeholder. PR-Agent normally posts it before the model call and edits/
+# removes it afterwards — but when every suggestion gets filtered out, the
+# placeholder is either left as a confusing orphan or replaced by the "No
+# suggestions" notice (also suppressed). Skipping it entirely avoids both.
+# Override with PRAGENT_PUBLISH_PROGRESS=true.
+export CONFIG__PUBLISH_OUTPUT_PROGRESS="${PRAGENT_PUBLISH_PROGRESS:-false}"
+
 REPO_PATH=""
 OWNER=""
 REPO=""
