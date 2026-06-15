@@ -70,14 +70,23 @@ class LocalGitProvider(GitProvider):
         )
         diff_files = []
         for diff_item in diffs:
-            if diff_item.a_blob is not None:
-                original_file_content_str = diff_item.a_blob.data_stream.read().decode('utf-8')
-            else:
-                original_file_content_str = ""  # empty file
-            if diff_item.b_blob is not None:
-                new_file_content_str = diff_item.b_blob.data_stream.read().decode('utf-8')
-            else:
-                new_file_content_str = ""  # empty file
+            # Skip binary / non-UTF-8 blobs (images, jars, fonts, etc.) — they can't be
+            # code-reviewed and decoding them as UTF-8 would crash the whole run.
+            try:
+                if diff_item.a_blob is not None:
+                    original_file_content_str = diff_item.a_blob.data_stream.read().decode('utf-8')
+                else:
+                    original_file_content_str = ""  # empty file
+                if diff_item.b_blob is not None:
+                    new_file_content_str = diff_item.b_blob.data_stream.read().decode('utf-8')
+                else:
+                    new_file_content_str = ""  # empty file
+                patch_str = diff_item.diff.decode('utf-8')
+            except UnicodeDecodeError:
+                get_logger().debug(
+                    f"Skipping binary/non-UTF-8 file in local diff: {diff_item.b_path or diff_item.a_path}"
+                )
+                continue
             edit_type = EDIT_TYPE.MODIFIED
             if diff_item.new_file:
                 edit_type = EDIT_TYPE.ADDED
@@ -88,7 +97,7 @@ class LocalGitProvider(GitProvider):
             diff_files.append(
                 FilePatchInfo(original_file_content_str,
                               new_file_content_str,
-                              diff_item.diff.decode('utf-8'),
+                              patch_str,
                               diff_item.b_path,
                               edit_type=edit_type,
                               old_filename=None if diff_item.a_path == diff_item.b_path else diff_item.a_path
