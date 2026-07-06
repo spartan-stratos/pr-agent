@@ -66,6 +66,13 @@ fi
 export CONFIG__MODEL="$MODEL"
 export CONFIG__FALLBACK_MODELS="[\"$MODEL\"]"
 
+# Disable upstream's native repo_context_files injection: this wrapper does its own
+# richer, domain-aware conventions injection below (stacks/cache/patterns tiers keyed
+# to the changed files). Leaving native on would double-inject AGENTS.md in github mode
+# and log a "LocalGitProvider does not support repository file fetching" warning every
+# local run. Override with PRAGENT_NATIVE_REPO_CONTEXT=1 to re-enable the native path.
+[ "${PRAGENT_NATIVE_REPO_CONTEXT:-0}" = "1" ] || export CONFIG__REPO_CONTEXT_FILES="[]"
+
 # Review prompt is externalized to scripts/lib/review-style.md (compressed for token budget).
 # Override with PRAGENT_REVIEW_STYLE_FILE=/path/to/alt.md
 REVIEW_STYLE_FILE="${PRAGENT_REVIEW_STYLE_FILE:-$ROOT/scripts/lib/review-style.md}"
