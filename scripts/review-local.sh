@@ -5,7 +5,7 @@ set -euo pipefail
 MODEL="${MODEL:-claude_cli/sonnet}"
 
 # Local self-review mode: diff HEAD vs a target branch with PR-Agent's LocalGitProvider.
-# No PR URL, no GitHub token, never posts — emits structured output to stdout.
+# No PR URL, no GitHub token, never posts - emits structured output to stdout.
 LOCAL_MODE=0
 PREVIEW_FLAG=""
 usage() {
@@ -77,7 +77,7 @@ REVIEW_STYLE="$(cat "$REVIEW_STYLE_FILE")"
 
 # Self-reflection score threshold (PR-Agent scores every `improve` suggestion 0-10).
 # 7 = "≥70% confidence", upstream's recommended high-band ceiling. Empirical: 8 was too
-# strict — observed score-7 findings on PR #502 (UberDriverIdBackfillJob/Test) that were
+# strict - observed score-7 findings on PR #502 (UberDriverIdBackfillJob/Test) that were
 # genuine defects with file:line evidence. Self-reflection scoring is also stochastic
 # (varies ±1 between runs), so 7 catches real defects that a 1-point dip would otherwise
 # silently drop.
@@ -85,14 +85,14 @@ REVIEW_STYLE="$(cat "$REVIEW_STYLE_FILE")"
 export PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD="${PRAGENT_SCORE_THRESHOLD:-7}"
 
 # Suppress the "No code suggestions found for the PR." placeholder comment.
-# When the score filter drops everything, posting a placeholder is noise — the
+# When the score filter drops everything, posting a placeholder is noise - the
 # absence of comments already signals "no findings". Override with
 # PRAGENT_PUBLISH_NO_SUGGESTIONS=true to restore upstream behavior.
 export PR_CODE_SUGGESTIONS__PUBLISH_OUTPUT_NO_SUGGESTIONS="${PRAGENT_PUBLISH_NO_SUGGESTIONS:-false}"
 
 # Suppress the "Generating PR code suggestions / Work in progress ..." progress
 # placeholder. PR-Agent normally posts it before the model call and edits/
-# removes it afterwards — but when every suggestion gets filtered out, the
+# removes it afterwards - but when every suggestion gets filtered out, the
 # placeholder is either left as a confusing orphan or replaced by the "No
 # suggestions" notice (also suppressed). Skipping it entirely avoids both.
 # Override with PRAGENT_PUBLISH_PROGRESS=true.
@@ -176,7 +176,7 @@ elif [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$OWNER" ] && [ -n "$RE
         fi
     done
 
-    # Tier 3: nothing landed at all — fall back to root AGENTS.md fetch.
+    # Tier 3: nothing landed at all - fall back to root AGENTS.md fetch.
     if [ "$REPO_AGENTS_LOADED" = "no" ] && REPO_AGENTS_CONTENT="$("$ROOT/scripts/agent-rules.sh" "$OWNER" "$REPO" 2>/dev/null)" && [ -n "$REPO_AGENTS_CONTENT" ]; then
         CONV+="## $REPO AGENTS.md"$'\n'
         CONV+="${REPO_AGENTS_CONTENT:0:6000}"
@@ -221,6 +221,24 @@ if [ -n "${PRAGENT_EXTRA_RULES_APPEND:-}" ]; then
     CONV+="$PRAGENT_EXTRA_RULES_APPEND"$'\n'
 fi
 
+# Diff-driven workspace code-context (local mode only): pull call-sites of the symbols
+# this diff changes so the reviewer sees blast radius beyond the diff. Appended AFTER the
+# rules so the 9000-char cap prioritizes conventions; code-context fills the remainder.
+# Best-effort: never fail the review. Disable with PRAGENT_WORKSPACE_INDEX=0.
+WORKSPACE_CTX=none
+if [ "$LOCAL_MODE" = "1" ] && [ "${PRAGENT_WORKSPACE_INDEX:-1}" != "0" ]; then
+    WI_ERR="$(mktemp)"
+    if WI_OUT="$("$ROOT/scripts/workspace-index.sh" "$TARGET" 2>"$WI_ERR")" && [ -n "$WI_OUT" ]; then
+        CONV+="## workspace code context"$'\n'"$WI_OUT"$'\n'
+        WORKSPACE_CTX="$(sed -n 's/^workspace-index: //p' "$WI_ERR" | head -1)"
+        [ -n "$WORKSPACE_CTX" ] || WORKSPACE_CTX=injected
+    else
+        WORKSPACE_CTX="$(sed -n 's/^workspace-index: //p' "$WI_ERR" | head -1)"
+        [ -n "$WORKSPACE_CTX" ] || WORKSPACE_CTX=none
+    fi
+    rm -f "$WI_ERR"
+fi
+
 CONV="${CONV:0:9000}"
 
 EXTRA_INSTRUCTIONS="$REVIEW_STYLE"
@@ -231,7 +249,7 @@ fi
 
 export PR_REVIEWER__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
 export PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
-echo "conventions: personal=$PERSONAL_CONVENTIONS_LOADED stacks=$STACKS_DISPLAY patterns=$PATTERNS_LOADED repo-AGENTS=$REPO_AGENTS_LOADED claude-md=$CLAUDE_MD_LOADED score-threshold=$PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD" >&2
+echo "conventions: personal=$PERSONAL_CONVENTIONS_LOADED stacks=$STACKS_DISPLAY patterns=$PATTERNS_LOADED repo-AGENTS=$REPO_AGENTS_LOADED claude-md=$CLAUDE_MD_LOADED workspace-ctx=$WORKSPACE_CTX score-threshold=$PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD" >&2
 
 # Committable suggestions only make sense when posting to a real PR (github mode).
 # Local self-review wants the structured code_suggestions JSON instead.
@@ -288,7 +306,7 @@ else
         ERRLOG="$(mktemp)"
         set +e
         # loguru sink is stdout. Capture the raw run for recovery, but hide the alarming
-        # "couldn't attach inline" ERROR/INFO lines from the console — those suggestions
+        # "couldn't attach inline" ERROR/INFO lines from the console - those suggestions
         # target lines outside the diff (e.g. pure renames, which have no hunks at all) and
         # are re-posted as a single PR comment below, so they are not actually lost.
         "$PY" -m pr_agent.cli --pr_url "$PR_URL" "$CMD" 2>&1 \
