@@ -48,10 +48,31 @@ if [ "$LOCAL_MODE" = "1" ]; then
         echo "Branch '$TARGET' does not exist locally. Fetch it first (e.g. git fetch origin $TARGET:$TARGET)." >&2
         exit 1
     fi
-    # LocalGitProvider requires a clean working tree.
-    if ! git diff --quiet || ! git diff --cached --quiet; then
-        echo "Working tree is not clean. Commit or stash changes before self-review." >&2
-        exit 1
+    # LocalGitProvider reads file content from the working tree, so a file UNDER REVIEW whose
+    # working copy differs from HEAD would be reviewed as something other than what HEAD says -
+    # that is the real invariant. Scope the check to the reviewed files rather than the whole tree:
+    # a stray unrelated file (routine when two sessions share a checkout, or when a long-running
+    # edit sits in another subdir) cannot affect the diff, and failing on it disabled self-review
+    # entirely - which silently downgrades every PR to Copilot-only review.
+    # PRAGENT_STRICT_CLEAN_TREE=1 restores the old whole-tree behaviour.
+    if [ "${PRAGENT_STRICT_CLEAN_TREE:-0}" = "1" ]; then
+        if ! git diff --quiet || ! git diff --cached --quiet; then
+            echo "Working tree is not clean. Commit or stash changes before self-review." >&2
+            exit 1
+        fi
+    else
+        _dirty_in_scope="$(comm -12 \
+            <(git diff --name-only "$TARGET"...HEAD | sort -u) \
+            <({ git diff --name-only; git diff --cached --name-only; } | sort -u))"
+        if [ -n "$_dirty_in_scope" ]; then
+            echo "These files are under review but have uncommitted changes - commit or stash them:" >&2
+            printf '  %s\n' $_dirty_in_scope >&2
+            exit 1
+        fi
+        _dirty_total="$({ git diff --name-only; git diff --cached --name-only; } | sort -u | grep -c . || true)"
+        if [ "${_dirty_total:-0}" -gt 0 ]; then
+            echo "note: $_dirty_total uncommitted file(s) outside the reviewed set - ignored." >&2
+        fi
     fi
     if ! command -v claude >/dev/null 2>&1; then
         echo "The 'claude' CLI is not on PATH. Install/authenticate it before self-review." >&2
@@ -89,7 +110,7 @@ REVIEW_STYLE="$(cat "$REVIEW_STYLE_FILE")"
 # (varies ±1 between runs), so 7 catches real defects that a 1-point dip would otherwise
 # silently drop.
 # Override with PRAGENT_SCORE_THRESHOLD=N (8 for strict, 0 to disable).
-export PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD="${PRAGENT_SCORE_THRESHOLD:-7}"
+export PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD="${PRAGENT_SCORE_THRESHOLD:-6}"
 
 # Suppress the "No code suggestions found for the PR." placeholder comment.
 # When the score filter drops everything, posting a placeholder is noise - the
@@ -145,6 +166,23 @@ if [ "$LOCAL_MODE" = "1" ]; then
                 REPO_AGENTS_LOADED=file
                 break
             fi
+        done
+    fi
+
+    # .rules/-derived review checklist. The .rules/ dir often sits at a workspace level ABOVE the
+    # git toplevel, so walk up from cwd (first hit wins). Single source of truth = .rules/; this file
+    # is the review-facing index into it. Toggle off with PRAGENT_REVIEW_CHECKLIST=0.
+    if [ "${PRAGENT_REVIEW_CHECKLIST:-1}" != "0" ] && [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ]; then
+        _rc_dir="$PWD"
+        while [ -n "$_rc_dir" ] && [ "$_rc_dir" != "/" ]; do
+            if [ -f "$_rc_dir/.rules/REVIEW_CHECKLIST.md" ]; then
+                CONV+="## review checklist (.rules/)"$'\n'
+                CONV+="$(head -c 6000 "$_rc_dir/.rules/REVIEW_CHECKLIST.md")"
+                CONV+=$'\n'
+                REPO_AGENTS_LOADED="${REPO_AGENTS_LOADED}+rules"
+                break
+            fi
+            _rc_dir="$(dirname "$_rc_dir")"
         done
     fi
 elif [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$OWNER" ] && [ -n "$REPO" ]; then

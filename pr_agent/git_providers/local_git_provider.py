@@ -51,10 +51,28 @@ class LocalGitProvider(GitProvider):
         Prepare the repository for PR-mimic generation.
         """
         get_logger().debug('Preparing repository for PR-mimic generation...')
-        if self.repo.is_dirty():
-            raise ValueError('The repository is not in a clean state. Please commit or stash pending changes.')
         if self.target_branch_name not in self.repo.heads:
             raise KeyError(f'Branch: {self.target_branch_name} does not exist')
+        # Only the files UNDER REVIEW need to match HEAD. get_diff_files() below diffs
+        # commit-to-commit (head commit vs merge base) and never reads working-tree content, so an
+        # unrelated dirty file cannot change the review. A whole-repo is_dirty() check therefore
+        # guards nothing while disabling self-review outright in any checkout that has unrelated
+        # pending work - which silently downgrades those changes to bot-only review.
+        dirty = set()
+        for d in self.repo.index.diff(None):          # working tree vs index
+            dirty.update(p for p in (d.a_path, d.b_path) if p)
+        for d in self.repo.index.diff('HEAD'):        # index vs HEAD (staged)
+            dirty.update(p for p in (d.a_path, d.b_path) if p)
+        if dirty:
+            merge_base = self.repo.merge_base(self.repo.head, self.repo.branches[self.target_branch_name])
+            reviewed = set()
+            for d in self.repo.head.commit.diff(merge_base, R=True):
+                reviewed.update(p for p in (d.a_path, d.b_path) if p)
+            conflict = sorted(dirty & reviewed)
+            if conflict:
+                raise ValueError(
+                    'These files are under review but have uncommitted changes. '
+                    'Please commit or stash them: ' + ', '.join(conflict))
 
     def is_supported(self, capability: str) -> bool:
         if capability in ['get_issue_comments', 'create_inline_comment', 'publish_inline_comments', 'get_labels',
@@ -70,7 +88,7 @@ class LocalGitProvider(GitProvider):
         )
         diff_files = []
         for diff_item in diffs:
-            # Skip binary / non-UTF-8 blobs (images, jars, fonts, etc.) — they can't be
+            # Skip binary / non-UTF-8 blobs (images, jars, fonts, etc.) - they can't be
             # code-reviewed and decoding them as UTF-8 would crash the whole run.
             try:
                 if diff_item.a_blob is not None:
