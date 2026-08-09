@@ -38,15 +38,32 @@ if [ ! -x "$PY" ]; then
 fi
 
 if [ "$LOCAL_MODE" = "1" ]; then
-    # Resolve target: explicit arg, else master, else main.
+    # Resolve target: explicit arg, else origin/master, else origin/main, else local master/main.
+    # Prefer the REMOTE-tracking ref over the local branch. In a multi-worktree setup the local
+    # master is routinely stale (it is checked out in another worktree, so `git fetch` does not
+    # move it), and diffing against it reviews commits the author never wrote - measured at 4
+    # files instead of 1 on a reproduction, 3 of them a teammate's merged work. Nothing errors,
+    # so the wrong review still records a marker and satisfies the PR gate.
     if [ -z "$TARGET" ]; then
-        if git show-ref --verify --quiet refs/heads/master; then TARGET=master
+        if git rev-parse --verify --quiet "origin/master^{commit}" >/dev/null; then TARGET=origin/master
+        elif git rev-parse --verify --quiet "origin/main^{commit}" >/dev/null; then TARGET=origin/main
+        elif git show-ref --verify --quiet refs/heads/master; then TARGET=master
         elif git show-ref --verify --quiet refs/heads/main; then TARGET=main
-        else echo "No target branch given and neither 'master' nor 'main' exists locally." >&2; exit 1; fi
+        else echo "No target branch given and neither 'origin/master', 'origin/main', 'master' nor 'main' exists." >&2; exit 1; fi
     fi
-    if ! git show-ref --verify --quiet "refs/heads/$TARGET"; then
+    # Accept ANY resolvable commit-ish (origin/master, a SHA, a tag), not only refs/heads/*.
+    # The old refs/heads-only check rejected `origin/master` outright, which is what forced the
+    # caller onto the stale local branch in the first place.
+    if ! git rev-parse --verify --quiet "${TARGET}^{commit}" >/dev/null; then
         echo "Branch '$TARGET' does not exist locally. Fetch it first (e.g. git fetch origin $TARGET:$TARGET)." >&2
         exit 1
+    fi
+    if [[ "$TARGET" == origin/* ]]; then
+        _local_target="${TARGET#origin/}"
+        if git show-ref --verify --quiet "refs/heads/$_local_target" \
+           && [ "$(git rev-parse "$TARGET")" != "$(git rev-parse "$_local_target")" ]; then
+            echo "note: using $TARGET instead of stale local $_local_target." >&2
+        fi
     fi
     # LocalGitProvider reads file content from the working tree, so a file UNDER REVIEW whose
     # working copy differs from HEAD would be reviewed as something other than what HEAD says -
@@ -79,7 +96,24 @@ if [ "$LOCAL_MODE" = "1" ]; then
         exit 1
     fi
     export CONFIG__GIT_PROVIDER=local
-    PR_URL="$TARGET"   # LocalGitProvider reads the pr_url argument as the target branch name
+    # LocalGitProvider reads pr_url as a target BRANCH NAME and looks it up in `repo.heads`
+    # (local_git_provider.py:57), so a remote-tracking ref like `origin/master` raises
+    # "Branch does not exist". Materialise a throwaway local ref pointing at the resolved
+    # commit and hand THAT over - the review then runs against the correct base without the
+    # provider ever seeing a remote ref. Removed on exit; never checked out, so it cannot
+    # disturb the working tree or another worktree.
+    PR_URL="$TARGET"
+    case "$TARGET" in
+      */*)
+        TMP_BASE_REF="review-base-$(git rev-parse --short "${TARGET}^{commit}")"
+        git branch -f "$TMP_BASE_REF" "${TARGET}^{commit}" >/dev/null 2>&1 || {
+            echo "Could not create temp base ref for '$TARGET'." >&2; exit 1; }
+        # shellcheck disable=SC2064  # expand TMP_BASE_REF now: it is stable for this run.
+        trap "git branch -D '$TMP_BASE_REF' >/dev/null 2>&1 || true" EXIT INT HUP TERM
+        PR_URL="$TMP_BASE_REF"
+        TARGET="$TMP_BASE_REF"   # keep downstream diffs (clean-tree check, workspace-index) aligned
+        ;;
+    esac
 else
     export GITHUB__USER_TOKEN="$(gh auth token)"
     export CONFIG__GIT_PROVIDER=github
