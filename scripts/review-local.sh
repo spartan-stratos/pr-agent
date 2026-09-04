@@ -226,22 +226,18 @@ if [ "$LOCAL_MODE" = "1" ]; then
     # runs on every change - never loaded a single pattern file. The whole
     # ~/.claude-library/rules/patterns tree was dead code on the path it was written for, and the
     # symptom was a quiet "stacks=none patterns=0" on the summary line rather than any error.
+    #
+    # ORDER IS LOAD-BEARING. CONV is truncated head-keep to CONV_CAP, so whatever is appended last
+    # is what gets cut. Patterns are trigger-matched against THIS diff; stack rules are generic and
+    # apply to every file of a language. So patterns go first. Appending the stack tier first put
+    # 31k of generic rules ahead of the cap and silently discarded every pattern - the summary line
+    # still said "patterns=4", because it counts what was SELECTED, not what survived.
     STACKS_ROOT="${PRAGENT_STACKS_ROOT:-$HOME/.claude-library/rules/stacks}"
     if [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ]; then
         STACKS="$(git diff --name-only "${TARGET}...HEAD" 2>/dev/null \
                   | "$ROOT/scripts/stacks-resolve.sh" 2>/dev/null || echo "core")"
         STACKS_DISPLAY="$(printf '%s\n' "$STACKS" | tr ' ' ',' | sed 's/,,*/,/g; s/^,//; s/,$//')"
         [ -n "$STACKS_DISPLAY" ] || STACKS_DISPLAY="none"
-
-        for stack in $STACKS; do
-            if [ -d "$STACKS_ROOT/$stack" ]; then
-                for sfile in "$STACKS_ROOT/$stack"/*.md; do
-                    [ -f "$sfile" ] || continue
-                    CONV+="## stack $stack: $(basename "$sfile" .md)"$'\n'
-                    CONV+="$(head -c 2500 "$sfile")"$'\n'
-                done
-            fi
-        done
 
         # Triggers match against changed-line CONTENT, not just paths, so feed the real diff.
         PATTERN_INPUT="$(git diff "${TARGET}...HEAD" 2>/dev/null || true)"
@@ -252,11 +248,27 @@ if [ "$LOCAL_MODE" = "1" ]; then
                 CHUNK="$(cat "$pfile" 2>/dev/null || true)"
                 if [ -n "$CHUNK" ]; then
                     pname="$(basename "$pfile" .md)"
-                    CONV+="## pattern: $pname"$'\n'"${CHUNK:0:2000}"$'\n'
+                    CONV+="## pattern: $pname"$'\n'"${CHUNK:0:${PRAGENT_PATTERN_CHARS:-3000}}"$'\n'
                     PATTERNS_LOADED=$((PATTERNS_LOADED + 1))
                 fi
             done < <(printf '%s\n' "$PATTERN_INPUT" | "$ROOT/scripts/patterns-resolve.sh" $STACKS 2>/dev/null)
         fi
+
+        # Stack rules fill whatever budget the patterns left, oldest-first per stack, and stop at
+        # the cap rather than overrunning it and relying on the final truncation.
+        STACK_BUDGET=$(( ${PRAGENT_CONV_CAP:-14000} - ${#CONV} ))
+        for stack in $STACKS; do
+            [ "$STACK_BUDGET" -gt 500 ] || break
+            [ -d "$STACKS_ROOT/$stack" ] || continue
+            for sfile in "$STACKS_ROOT/$stack"/*.md; do
+                [ -f "$sfile" ] || continue
+                [ "$STACK_BUDGET" -gt 500 ] || break
+                take=$(( STACK_BUDGET < 2500 ? STACK_BUDGET : 2500 ))
+                SCHUNK="$(head -c "$take" "$sfile")"
+                CONV+="## stack $stack: $(basename "$sfile" .md)"$'\n'"$SCHUNK"$'\n'
+                STACK_BUDGET=$(( STACK_BUDGET - ${#SCHUNK} ))
+            done
+        done
     fi
 elif [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$OWNER" ] && [ -n "$REPO" ]; then
     STACKS_ROOT="${PRAGENT_STACKS_ROOT:-$HOME/.claude-library/rules/stacks}"
@@ -313,7 +325,7 @@ elif [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$OWNER" ] && [ -n "$RE
             CHUNK="$(cat "$pfile" 2>/dev/null || true)"
             if [ -n "$CHUNK" ]; then
                 pname="$(basename "$pfile" .md)"
-                CONV+="## pattern: $pname"$'\n'"${CHUNK:0:2000}"$'\n'
+                CONV+="## pattern: $pname"$'\n'"${CHUNK:0:${PRAGENT_PATTERN_CHARS:-3000}}"$'\n'
                 PATTERNS_LOADED=$((PATTERNS_LOADED + 1))
             fi
         done < <(printf '%s\n' "$PATTERN_INPUT" | "$ROOT/scripts/patterns-resolve.sh" $STACKS 2>/dev/null)
@@ -357,7 +369,14 @@ if [ "$LOCAL_MODE" = "1" ] && [ "${PRAGENT_WORKSPACE_INDEX:-1}" != "0" ]; then
     rm -f "$WI_ERR"
 fi
 
-CONV="${CONV:0:9000}"
+# Truncation is head-keep, so anything appended late is silently dropped. That is how the entire
+# patterns tier used to vanish while the summary line still reported it as loaded. Report the
+# before/after size so a budget overrun is visible instead of being inferred from bad reviews.
+CONV_CAP="${PRAGENT_CONV_CAP:-14000}"
+[ -n "${PRAGENT_DUMP_CONV:-}" ] && printf '%s' "$CONV" > "${PRAGENT_DUMP_CONV}"
+CONV_CHARS_PRE=${#CONV}
+CONV="${CONV:0:$CONV_CAP}"
+CONV_TRUNC=$(( CONV_CHARS_PRE - ${#CONV} ))
 
 EXTRA_INSTRUCTIONS="$REVIEW_STYLE"
 if [ -n "$CONV" ]; then
@@ -367,7 +386,7 @@ fi
 
 export PR_REVIEWER__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
 export PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
-echo "conventions: personal=$PERSONAL_CONVENTIONS_LOADED stacks=$STACKS_DISPLAY patterns=$PATTERNS_LOADED repo-AGENTS=$REPO_AGENTS_LOADED claude-md=$CLAUDE_MD_LOADED workspace-ctx=$WORKSPACE_CTX score-threshold=$PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD" >&2
+echo "conventions: personal=$PERSONAL_CONVENTIONS_LOADED stacks=$STACKS_DISPLAY patterns=$PATTERNS_LOADED conv-chars=$CONV_CHARS_PRE/$CONV_CAP dropped=$CONV_TRUNC repo-AGENTS=$REPO_AGENTS_LOADED claude-md=$CLAUDE_MD_LOADED workspace-ctx=$WORKSPACE_CTX score-threshold=$PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD" >&2
 
 # Committable suggestions only make sense when posting to a real PR (github mode).
 # Local self-review wants the structured code_suggestions JSON instead.
