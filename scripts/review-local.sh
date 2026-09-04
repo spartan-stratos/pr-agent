@@ -219,6 +219,45 @@ if [ "$LOCAL_MODE" = "1" ]; then
             _rc_dir="$(dirname "$_rc_dir")"
         done
     fi
+
+    # Stacks + patterns tiers, same as the GitHub branch below but sourced from the LOCAL diff.
+    #
+    # These used to exist only in the PR branch, which meant /review-local - the pre-PR gate that
+    # runs on every change - never loaded a single pattern file. The whole
+    # ~/.claude-library/rules/patterns tree was dead code on the path it was written for, and the
+    # symptom was a quiet "stacks=none patterns=0" on the summary line rather than any error.
+    STACKS_ROOT="${PRAGENT_STACKS_ROOT:-$HOME/.claude-library/rules/stacks}"
+    if [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ]; then
+        STACKS="$(git diff --name-only "${TARGET}...HEAD" 2>/dev/null \
+                  | "$ROOT/scripts/stacks-resolve.sh" 2>/dev/null || echo "core")"
+        STACKS_DISPLAY="$(printf '%s\n' "$STACKS" | tr ' ' ',' | sed 's/,,*/,/g; s/^,//; s/,$//')"
+        [ -n "$STACKS_DISPLAY" ] || STACKS_DISPLAY="none"
+
+        for stack in $STACKS; do
+            if [ -d "$STACKS_ROOT/$stack" ]; then
+                for sfile in "$STACKS_ROOT/$stack"/*.md; do
+                    [ -f "$sfile" ] || continue
+                    CONV+="## stack $stack: $(basename "$sfile" .md)"$'\n'
+                    CONV+="$(head -c 2500 "$sfile")"$'\n'
+                done
+            fi
+        done
+
+        # Triggers match against changed-line CONTENT, not just paths, so feed the real diff.
+        PATTERN_INPUT="$(git diff "${TARGET}...HEAD" 2>/dev/null || true)"
+        if [ -n "$PATTERN_INPUT" ] && [ -n "$STACKS" ]; then
+            while IFS= read -r pfile; do
+                [ -z "$pfile" ] && continue
+                [ ! -f "$pfile" ] && continue
+                CHUNK="$(cat "$pfile" 2>/dev/null || true)"
+                if [ -n "$CHUNK" ]; then
+                    pname="$(basename "$pfile" .md)"
+                    CONV+="## pattern: $pname"$'\n'"${CHUNK:0:2000}"$'\n'
+                    PATTERNS_LOADED=$((PATTERNS_LOADED + 1))
+                fi
+            done < <(printf '%s\n' "$PATTERN_INPUT" | "$ROOT/scripts/patterns-resolve.sh" $STACKS 2>/dev/null)
+        fi
+    fi
 elif [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$OWNER" ] && [ -n "$REPO" ]; then
     STACKS_ROOT="${PRAGENT_STACKS_ROOT:-$HOME/.claude-library/rules/stacks}"
     REPO_CACHE_ROOT="${PRAGENT_REPO_CACHE_ROOT:-$HOME/.claude/cache/stacks-from}"

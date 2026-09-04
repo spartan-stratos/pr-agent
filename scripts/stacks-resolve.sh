@@ -31,10 +31,26 @@ while IFS= read -r f; do
         *.tsx|*.ts|*.jsx|*.js|*.css|*.scss)
             add_stack frontend-react
             ;;
+        # A Gradle build file IS backend architecture: dependency scope and direction are where
+        # module-layering violations actually land, and they never appear in a .kt diff.
+        *.gradle|*.gradle.kts|settings.gradle|gradle/*.toml|*.versions.toml)
+            add_stack backend-micronaut
+            add_stack shared-backend
+            ;;
+        # logback.xml, application.yml and the like carry runtime behaviour that no Kotlin file
+        # shows. A logging config that silently drops every appender is a backend defect.
+        */resources/*.xml|*logback*.xml|*/resources/*.yml|*/resources/*.yaml|*application*.yml)
+            add_stack backend-micronaut
+            ;;
     esac
     case "$f" in
-        *docker-compose*|.github/workflows/*)
+        *docker-compose*|.github/workflows/*|Dockerfile*|*/Dockerfile*|*.dockerfile)
             add_stack infrastructure
+            ;;
+        # Flyway migrations live under database-migration/sql/ and carry a numbering contract that
+        # a plain *.sql match already covers, but the conf file governs schema wiping.
+        *flyway.conf|*/database-migration/*)
+            add_stack database
             ;;
     esac
 done
