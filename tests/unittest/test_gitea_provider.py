@@ -8,6 +8,17 @@ from pr_agent.git_providers.gitea_provider import GiteaProvider
 
 
 class TestGiteaProvider:
+    @patch("pr_agent.git_providers.gitea_provider.giteapy.ApiClient")
+    @patch("pr_agent.git_providers.gitea_provider.get_settings")
+    def test_diff_cache_starts_unloaded(self, mock_get_settings, _):
+        mock_get_settings.return_value.get.side_effect = lambda key, default=None: {
+            "GITEA.PERSONAL_ACCESS_TOKEN": "token",
+        }.get(key, default)
+
+        provider = GiteaProvider("https://gitea.example.com/repository")
+
+        assert provider.diff_files is None
+
     @patch('pr_agent.git_providers.gitea_provider.get_settings')
     @patch('pr_agent.git_providers.gitea_provider.giteapy.ApiClient')
     def test_gitea_provider_auth_header(self, mock_api_client_cls, mock_get_settings):
@@ -625,3 +636,286 @@ class TestGiteaProviderAddFileDiff:
             index=123,
             body={"body": "Updated description", "title": "Updated title"}
         )
+
+
+class TestGiteaProviderUserFacingLinks:
+    """Regression tests for #2612: links published in comments must use the
+    user-facing base URL, not the (possibly internal) API base URL.
+
+    ``__init__`` performs network calls, so instances are built with ``__new__``
+    and only the attributes under test are wired up. ``base_url`` below stands
+    in for an internal address (e.g. a Docker service name) that users cannot
+    browse. ``pr_url`` uses the user-facing form throughout: ``_parse_pr_url``
+    rejects the API form, so a constructed provider could never carry it, and
+    Gitea sets ``url``/``html_url`` on the PR payload to the user-facing page.
+    """
+
+    @staticmethod
+    def _provider(pr_html_url="", pr_url="http://forgejo:3000/owner/repo/pulls/4", pr_number=4):
+        from pr_agent.git_providers.gitea_provider import GiteaProvider
+
+        provider = GiteaProvider.__new__(GiteaProvider)
+        provider.logger = MagicMock()
+        provider.owner = "owner"
+        provider.repo = "repo"
+        provider.pr_number = pr_number
+        provider.base_url = "http://forgejo:3000"
+        provider.pr_url = pr_url
+        provider.pr = None if pr_html_url is None else MagicMock(html_url=pr_html_url)
+        return provider
+
+    @staticmethod
+    def _settings(web_url="", configured_url=None):
+        # configured_url=None leaves GITEA.URL unset, exercising the derivation path.
+        settings = MagicMock()
+        values = {"GITEA.WEB_URL": web_url}
+        if configured_url is not None:
+            values["GITEA.URL"] = configured_url
+        settings.get.side_effect = lambda k, d=None: values.get(k, d)
+        return settings
+
+    @patch("pr_agent.git_providers.gitea_provider.get_settings")
+    def test_web_url_setting_takes_precedence(self, mock_get_settings):
+        mock_get_settings.return_value = self._settings(
+            web_url="https://git.example.com/forgejo/", configured_url="http://forgejo:3000")
+        provider = self._provider(pr_html_url="https://other.example.com/owner/repo/pulls/4")
+
+        assert provider._resolve_base_url_html() == "https://git.example.com/forgejo"
+
+    @patch("pr_agent.git_providers.gitea_provider.get_settings")
+    def test_configured_url_preferred_over_pr_html_url(self, mock_get_settings):
+        # An operator-set GITEA.URL wins over html_url, which the server builds from
+        # its own ROOT_URL - still the (wrong) default on some instances.
+        mock_get_settings.return_value = self._settings(configured_url="http://forgejo:3000")
+        provider = self._provider(pr_html_url="http://localhost:3000/owner/repo/pulls/4")
+
+        assert provider._resolve_base_url_html() == "http://forgejo:3000"
+
+    @patch("pr_agent.git_providers.gitea_provider.get_settings")
+    def test_shipped_default_url_does_not_shadow_pr_html_url(self, mock_get_settings):
+        # configuration.toml always ships url = "https://gitea.com", so the default must not
+        # count as operator-set - otherwise the html_url derivation is unreachable in
+        # production and the #2612 scenario regresses (review feedback on #2617).
+        mock_get_settings.return_value = self._settings(configured_url="https://gitea.com")
+        provider = self._provider(pr_html_url="https://git.example.com/forgejo/owner/repo/pulls/4")
+
+        assert provider._resolve_base_url_html() == "https://git.example.com/forgejo"
+
+    @patch("pr_agent.git_providers.gitea_provider.get_settings")
+    def test_shipped_default_url_with_trailing_slash_does_not_shadow(self, mock_get_settings):
+        mock_get_settings.return_value = self._settings(configured_url="https://gitea.com/")
+        provider = self._provider(pr_html_url="https://git.example.com/forgejo/owner/repo/pulls/4")
+
+        assert provider._resolve_base_url_html() == "https://git.example.com/forgejo"
+
+    @patch("pr_agent.git_providers.gitea_provider.get_settings")
+    def test_derives_base_url_from_pr_html_url(self, mock_get_settings):
+        # Zero-config case: Forgejo/Gitea builds html_url from its external ROOT_URL,
+        # so the user-facing base URL can be derived even without a web_url setting.
+        mock_get_settings.return_value = self._settings()
+        provider = self._provider(pr_html_url="https://git.example.com/forgejo/owner/repo/pulls/4")
+
+        assert provider._resolve_base_url_html() == "https://git.example.com/forgejo"
+
+    @patch("pr_agent.git_providers.gitea_provider.get_settings")
+    def test_falls_back_to_base_url_without_pr(self, mock_get_settings):
+        # Issue flow has no PR object; existing single-URL deployments stay unchanged.
+        mock_get_settings.return_value = self._settings()
+        provider = self._provider(pr_html_url=None)
+
+        assert provider._resolve_base_url_html() == "http://forgejo:3000"
+
+    @patch("pr_agent.git_providers.gitea_provider.get_settings")
+    def test_falls_back_to_base_url_when_html_url_missing_or_foreign(self, mock_get_settings):
+        mock_get_settings.return_value = self._settings()
+
+        assert self._provider(pr_html_url="")._resolve_base_url_html() == "http://forgejo:3000"
+        foreign = self._provider(pr_html_url="https://ci.example.com/artifacts/owner/repo")
+        assert foreign._resolve_base_url_html() == "http://forgejo:3000"
+
+    @patch("pr_agent.git_providers.gitea_provider.get_settings")
+    def test_get_line_link_uses_user_facing_base_url(self, mock_get_settings):
+        mock_get_settings.return_value = self._settings(web_url="https://git.example.com/forgejo")
+        provider = self._provider()
+        # Mirror __init__ so the resolver wiring (self.base_url_html assignment) is covered too.
+        provider.base_url_html = provider._resolve_base_url_html()
+        provider.get_pr_branch = MagicMock(return_value="feat/retry")
+
+        prefix = "https://git.example.com/forgejo/owner/repo/src/branch/feat/retry/app/storage.py"
+        assert provider.get_line_link("app/storage.py", 24) == f"{prefix}#L24"
+        assert provider.get_line_link("app/storage.py", 24, 30) == f"{prefix}#L24-L30"
+        assert provider.get_line_link("app/storage.py", 24, 20) == f"{prefix}#L24-L24"
+        assert provider.get_line_link("app/storage.py", 24, "not-a-number") == f"{prefix}#L24"
+        assert provider.get_line_link("app/storage.py", -1) == prefix
+
+    @patch("pr_agent.git_providers.gitea_provider.get_settings")
+    def test_get_pr_url_uses_user_facing_base_url(self, mock_get_settings):
+        # html_url here comes from a stale ROOT_URL; the configured WEB_URL must win.
+        mock_get_settings.return_value = self._settings(web_url="https://git.example.com/forgejo")
+        provider = self._provider(pr_html_url="http://localhost:3000/owner/repo/pulls/4")
+        provider.base_url_html = provider._resolve_base_url_html()
+
+        assert provider.get_pr_url() == "https://git.example.com/forgejo/owner/repo/pulls/4"
+
+    @patch("pr_agent.git_providers.gitea_provider.get_settings")
+    def test_get_pr_url_uses_configured_base_url(self, mock_get_settings):
+        mock_get_settings.return_value = self._settings(configured_url="http://forgejo:3000")
+        provider = self._provider(pr_html_url="http://localhost:3000/owner/repo/pulls/4")
+        provider.base_url_html = provider._resolve_base_url_html()
+
+        assert provider.get_pr_url() == "http://forgejo:3000/owner/repo/pulls/4"
+
+    @patch("pr_agent.git_providers.gitea_provider.get_settings")
+    def test_get_pr_url_falls_back_to_raw_pr_url(self, mock_get_settings):
+        # Issue flow has no PR number; get_pr_url returns the raw URL unchanged.
+        mock_get_settings.return_value = self._settings()
+        provider = self._provider(pr_html_url=None, pr_number=None)
+        provider.base_url_html = provider._resolve_base_url_html()
+
+        assert provider.get_pr_url() == "http://forgejo:3000/owner/repo/pulls/4"
+
+
+class TestGiteaProviderUrlParsing:
+    """Cover both URL forms: Gitea sets ``pull_request.url`` to the web page,
+    Forgejo sets it to ``/api/v1/repos/{owner}/{repo}/pulls/{n}``.
+
+    ``__init__`` performs network calls, so build the provider with ``__new__``
+    and exercise the pure helper only.
+    """
+
+    @staticmethod
+    def _provider():
+        return GiteaProvider.__new__(GiteaProvider)
+
+    def test_parse_pr_url_accepts_web_and_api_forms(self):
+        provider = self._provider()
+        assert provider._parse_pr_url("https://gitea.example.com/owner/repo/pulls/1") == ("owner", "repo", 1)
+        assert provider._parse_pr_url(
+            "https://gitea.example.com/api/v1/repos/owner/repo/pulls/1") == ("owner", "repo", 1)
+
+    def test_parse_issue_url_accepts_web_and_api_forms(self):
+        provider = self._provider()
+        assert provider._parse_issue_url("https://gitea.example.com/owner/repo/issues/5") == ("owner", "repo", 5)
+        assert provider._parse_issue_url(
+            "https://gitea.example.com/api/v1/repos/owner/repo/issues/5") == ("owner", "repo", 5)
+
+
+class TestGiteaProviderInlineCommentStatus:
+    """Regression tests for the ``/improve`` inline-comment path:
+
+    1. ``publish_inline_comments``/``publish_code_suggestions`` never reported
+       success or failure, so ``PRCodeSuggestions.push_inline_code_suggestions``
+       always treated the call as failed and republished every suggestion a
+       second time, duplicating each one.
+    2. ``RepoApi.create_inline_comment`` posted to ``pulls/{id}/reviews``
+       without an ``event``, which Gitea/Forgejo defaults to a draft review
+       (state ``PENDING``) invisible to everyone but its author - there is no
+       later step in this flow that submits it.
+    """
+
+    @staticmethod
+    def _provider(create_inline_comment_result=True):
+        provider = GiteaProvider.__new__(GiteaProvider)
+        provider.logger = MagicMock()
+        provider.owner = "owner"
+        provider.repo = "repo"
+        provider.pr_number = 4
+        provider.enabled_pr = True
+        provider.last_commit = MagicMock(sha="head-sha")
+        provider.diff_files = []
+        provider.repo_api = MagicMock()
+        provider.repo_api.create_inline_comment.return_value = (
+            MagicMock() if create_inline_comment_result else None
+        )
+        return provider
+
+    def test_publish_inline_comments_reports_success(self):
+        provider = self._provider(create_inline_comment_result=True)
+
+        assert provider.publish_inline_comments([{"path": "a.py", "body": "x"}]) is True
+
+    def test_publish_inline_comments_reports_failure(self):
+        provider = self._provider(create_inline_comment_result=False)
+
+        assert provider.publish_inline_comments([{"path": "a.py", "body": "x"}]) is False
+
+    @pytest.mark.parametrize(
+        "error", [ApiException(reason="API rejected the comment"), RuntimeError("transport failed")]
+    )
+    def test_publish_inline_comments_reports_exception_as_failure(self, error):
+        provider = self._provider()
+        provider.repo_api.create_inline_comment.side_effect = error
+
+        assert provider.publish_inline_comments([{"path": "a.py", "body": "x"}]) is False
+
+    def test_publish_code_suggestions_does_not_republish_on_success(self):
+        # Before the fix, a truthy result here was still treated as failure by
+        # PRCodeSuggestions.push_inline_code_suggestions, which republished
+        # every suggestion a second time.
+        provider = self._provider(create_inline_comment_result=True)
+        suggestions = [{"body": "**Suggestion:** fix it", "relevant_file": "a.py",
+                        "relevant_lines_start": 3}]
+
+        result = provider.publish_code_suggestions(suggestions)
+
+        assert result is True
+        assert provider.repo_api.create_inline_comment.call_count == 1
+
+    def test_publish_code_suggestions_reports_failure(self):
+        provider = self._provider(create_inline_comment_result=False)
+        suggestions = [{"body": "**Suggestion:** fix it", "relevant_file": "a.py",
+                        "relevant_lines_start": 3}]
+
+        assert provider.publish_code_suggestions(suggestions) is False
+
+    def test_publish_code_suggestions_reports_success_on_partial_failure(self):
+        # A partial failure must not report failure overall: the caller
+        # (PRCodeSuggestions.push_inline_code_suggestions) republishes the whole
+        # list on any falsy result, which would post the two already-accepted
+        # suggestions a second time. Exactly one create_inline_comment call per
+        # suggestion, no retries.
+        provider = self._provider()
+        provider.repo_api.create_inline_comment.side_effect = [MagicMock(), None, MagicMock()]
+        suggestions = [
+            {"body": "**Suggestion:** one", "relevant_file": "a.py", "relevant_lines_start": 1},
+            {"body": "**Suggestion:** two", "relevant_file": "a.py", "relevant_lines_start": 2},
+            {"body": "**Suggestion:** three", "relevant_file": "a.py", "relevant_lines_start": 3},
+        ]
+
+        result = provider.publish_code_suggestions(suggestions)
+
+        assert result is True
+        assert provider.repo_api.create_inline_comment.call_count == 3
+
+    def test_publish_code_suggestions_reports_success_on_partial_exception(self):
+        provider = self._provider()
+        provider.repo_api.create_inline_comment.side_effect = [
+            MagicMock(), ApiException(reason="API rejected the comment"), MagicMock()
+        ]
+        suggestions = [
+            {"body": "**Suggestion:** one", "relevant_file": "a.py", "relevant_lines_start": 1},
+            {"body": "**Suggestion:** two", "relevant_file": "a.py", "relevant_lines_start": 2},
+            {"body": "**Suggestion:** three", "relevant_file": "a.py", "relevant_lines_start": 3},
+        ]
+
+        result = provider.publish_code_suggestions(suggestions)
+
+        assert result is True
+        assert provider.repo_api.create_inline_comment.call_count == 3
+
+    @patch("pr_agent.git_providers.gitea_provider.giteapy.ApiClient")
+    def test_create_inline_comment_submits_as_comment_not_pending(self, mock_api_client_cls):
+        from pr_agent.git_providers.gitea_provider import RepoApi
+
+        client = mock_api_client_cls.return_value
+        client.call_api.return_value = MagicMock()
+        repo_api = RepoApi(client)
+
+        repo_api.create_inline_comment(
+            owner="owner", repo="repo", pr_number=4,
+            body="Inline comment", commit_id="head-sha",
+            comments=[{"path": "a.py", "body": "x"}],
+        )
+
+        _, kwargs = client.call_api.call_args
+        assert kwargs["body"]["event"] == "COMMENT"

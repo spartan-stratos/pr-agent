@@ -28,6 +28,55 @@ surface and the wrapper (`scripts/review-local.sh`) that drives it.
    inside git worktrees/submodules where `.git` is a file. Now accepts either.
    **Upstreamable**: one-line fix to a real bug hitting every worktree user.
 
+## Upstream merge status (2026-09-04, upstream/main @ 216 commits)
+
+Checked at the merge of `upstream/main` into `custom-upstream-2026-09`.
+
+| # | Patch | Status after merge |
+|---|---|---|
+| 1 | stdout-sink dropped-suggestion recovery | Still applies. Lives entirely in `scripts/`, which upstream never touches. |
+| 2 | out-of-hunk inline-comment drop handling | Still applies (wrapper side). |
+| 3 | SIGPIPE-under-`pipefail` truncation fix | Still applies. `scripts/` only. |
+| 4 | 404-as-fake-conventions guard | Still applies. `scripts/` only. |
+| 5 | worktree `.git`-file repo-root detection | **Superseded upstream.** `config_loader.py` merged with no conflict; upstream's `_find_repository_root()` now accepts `.git` as a file. The fork no longer carries this. |
+| 6 | scoped clean-tree check (see below) | Still applies. Merged cleanly, survives. |
+
+Two conflicts in `local_git_provider.py` were resolved by taking UPSTREAM: it has
+independently implemented the same binary/non-UTF-8 blob skip and the `b_path or a_path`
+fallback for deletions, in a cleaner form. Those two fork deltas are now redundant.
+
+`requirements.txt` and `requirements-dev.txt` were DELETED upstream; dependencies moved to
+`pyproject.toml`. The deletion was accepted after confirming all six packages the fork bumped
+for Dependabot (commit f32aef3f) are met or exceeded there: aiohttp 3.14.3, dynaconf 3.2.13,
+GitPython 3.1.59 (higher than the fork's 3.1.57), PyJWT 2.13.0, ujson 5.13.0, pytest 9.0.3.
+
+`pr_agent/algo/__init__.py` was taken from upstream wholesale. Upstream now GENERATES
+provider-prefixed Claude ids from `_CLAUDE_MODEL_FAMILIES`, which already covers opus-4-8,
+opus-5, sonnet-5, sonnet-4-6, opus-4-7 and fable-5, so the fork's hand-maintained model lists
+are obsolete. Only the three `claude_cli/*` token entries were re-applied by hand, because the
+Claude CLI aliases never pass through that generator.
+
+`pr_agent/agent/pr_agent.py` was an add/add: the fork's `get_ai_handler()` (claude_cli routing)
+and upstream's `_split_command()`/`prepare_command()` tokenizer. Both kept.
+
+## Patch 6 - scoped clean-tree check (was undocumented until 2026-09-04)
+
+`LocalGitProvider.__init__` upstream refuses to run when `repo.is_dirty()` - a WHOLE-TREE check.
+The fork replaces it with a per-file check: only files actually under review must match HEAD.
+
+`get_diff_files()` diffs commit-to-commit and never reads working-tree content, so an unrelated
+dirty file cannot change the review. The upstream check therefore guards nothing while disabling
+self-review outright in any checkout with unrelated pending work - which silently downgrades
+those changes to bot-only review, a review GAP that looks like a passing workflow. This workspace
+routinely has two sessions in one checkout, so it fired constantly.
+
+`PRAGENT_STRICT_CLEAN_TREE=1` restores upstream behaviour. `/review-local` step 1 mirrors the
+same scoping in the wrapper.
+
+**This patch was carried for months without an entry here**, which is exactly the failure this
+file exists to prevent: an undocumented patch is one a future merge deletes silently. It merged
+cleanly this time by luck, not by review.
+
 ## Migration trigger (pre-committed)
 
 The **next** bug that requires editing `pr_agent/config_loader.py` or
