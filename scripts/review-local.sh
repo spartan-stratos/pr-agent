@@ -31,6 +31,8 @@ fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="$ROOT/.venv/bin/python"
+# shellcheck source=lib/local-mode-helpers.sh disable=SC1091
+source "$ROOT/scripts/lib/local-mode-helpers.sh"
 
 if [ ! -x "$PY" ]; then
     echo "Missing $PY. Create the venv with: python3 -m venv .venv && .venv/bin/pip install -e ." >&2
@@ -189,18 +191,16 @@ if [ -f "$HOME/.config/pr-agent/conventions.md" ]; then
 fi
 
 if [ "$LOCAL_MODE" = "1" ]; then
-    # Local mode: read on-disk rules (no GitHub API). First hit wins: AGENTS.md, then .claude/CLAUDE.md.
+    # Local mode: read on-disk rules (no GitHub API). First hit wins: AGENTS.md,
+    # then CLAUDE.md, then .claude/CLAUDE.md (see find_repo_convention_file).
     TOPLEVEL="$(git rev-parse --show-toplevel 2>/dev/null || true)"
     if [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$TOPLEVEL" ]; then
-        for rel in AGENTS.md .claude/CLAUDE.md; do
-            if [ -f "$TOPLEVEL/$rel" ]; then
-                CONV+="## repo $rel"$'\n'
-                CONV+="$(head -c 6000 "$TOPLEVEL/$rel")"
-                CONV+=$'\n'
-                REPO_AGENTS_LOADED=file
-                break
-            fi
-        done
+        if _repo_conv_rel="$(find_repo_convention_file "$TOPLEVEL")"; then
+            CONV+="## repo $_repo_conv_rel"$'\n'
+            CONV+="$(head -c 6000 "$TOPLEVEL/$_repo_conv_rel")"
+            CONV+=$'\n'
+            REPO_AGENTS_LOADED=file
+        fi
     fi
 
     # .rules/-derived review checklist. The .rules/ dir often sits at a workspace level ABOVE the
@@ -388,6 +388,13 @@ export PR_REVIEWER__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
 export PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
 echo "conventions: personal=$PERSONAL_CONVENTIONS_LOADED stacks=$STACKS_DISPLAY patterns=$PATTERNS_LOADED conv-chars=$CONV_CHARS_PRE/$CONV_CAP dropped=$CONV_TRUNC repo-AGENTS=$REPO_AGENTS_LOADED claude-md=$CLAUDE_MD_LOADED workspace-ctx=$WORKSPACE_CTX score-threshold=$PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD" >&2
 
+# Real diff size, used both for review-coverage accounting and the improve
+# empty-suggestions note below. Local mode only - TARGET is unset otherwise.
+TOTAL_DIFF_FILES=0
+if [ "$LOCAL_MODE" = "1" ]; then
+    TOTAL_DIFF_FILES="$(git diff --name-only "${TARGET}...HEAD" 2>/dev/null | grep -c . || true)"
+fi
+
 # Committable suggestions only make sense when posting to a real PR (github mode).
 # Local self-review wants the structured code_suggestions JSON instead.
 if [ "$CMD" = "improve" ] && [ "$LOCAL_MODE" = "0" ]; then
@@ -397,7 +404,9 @@ fi
 # Local mode and --preview both produce structured stdout and never post.
 if [ "$LOCAL_MODE" = "1" ] || [ "$PREVIEW_FLAG" = "--preview" ]; then
     export CONFIG__PUBLISH_OUTPUT=false
-    exec "$PY" - "$PR_URL" "$CMD" <<'PY'
+    OUT_FILE="$(mktemp)"
+    set +e
+    "$PY" - "$PR_URL" "$CMD" "$TOTAL_DIFF_FILES" <<'PY' > "$OUT_FILE"
 import asyncio
 import json
 import os
@@ -412,6 +421,7 @@ from pr_agent.tools.pr_reviewer import PRReviewer
 async def main() -> None:
     pr_url = sys.argv[1]
     cmd = sys.argv[2]
+    total_diff_files = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 0
 
     settings = get_settings()
     settings.set("CONFIG.PUBLISH_OUTPUT", False)
@@ -427,14 +437,30 @@ async def main() -> None:
         await tool.run()
         # With publish_output=False the tool clobbers settings.data to {"artifact": <md>};
         # the structured suggestions (with score/label per item) live on tool.data.
-        print(json.dumps(getattr(tool, "data", None) or {"code_suggestions": []},
-                         indent=2, default=str))
+        raw_data = getattr(tool, "data", None)
+        if not raw_data:
+            print("WARNING: improve produced no data (model output lost or empty diff)",
+                  file=sys.stderr)
+        data = raw_data or {"code_suggestions": []}
+        suggestions = data.get("code_suggestions") or []
+        if not suggestions and total_diff_files > 20:
+            print(f"note: 0 suggestions on a {total_diff_files}-file diff - "
+                  "treat as unverified, not clean", file=sys.stderr)
+        print(json.dumps(data, indent=2, default=str))
     else:
         raise SystemExit(f"Unsupported command: {cmd}")
 
 
 asyncio.run(main())
 PY
+    rc=$?
+    set -e
+    cat "$OUT_FILE"
+    if [ "$LOCAL_MODE" = "1" ] && [ "$CMD" = "review" ]; then
+        compute_review_coverage "$(cat "$OUT_FILE")" "$TOTAL_DIFF_FILES"
+    fi
+    rm -f "$OUT_FILE"
+    exit $rc
 else
     export CONFIG__PUBLISH_OUTPUT=true
     if [ "$CMD" = "improve" ] && [ "$LOCAL_MODE" = "0" ]; then
