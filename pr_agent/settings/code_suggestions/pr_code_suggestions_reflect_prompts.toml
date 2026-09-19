@@ -28,6 +28,12 @@ Key guidelines for evaluation:
   - Avoid inflating scores for suggestions that, while correct, offer only marginal improvements or optimizations.
 - Maintain the original order of suggestions in your feedback, corresponding to their input sequence.
 
+Defect vs patch (score the defect, not the patch):
+- The score measures whether the problem the suggestion describes really exists in the PR code, and how much it matters.
+- The diff is a partial view of the codebase. When the defect is supported by the diff but 'improved_code' is incomplete, uses a symbol declared outside the diff, or needs adjustment to compile, do NOT score it 0 or lower it for that reason. Score the defect, and name the patch gap in 'why'. A declaration missing from the diff is not evidence that it does not exist.
+- Score 0 only when the defect claim itself is wrong.
+- If the suggestion contradicts intent stated in a code comment or doc that is visible in the diff (for example a caller explaining why a behaviour is deliberate), the defect claim is wrong: score it 0-2.
+
 Additional scoring considerations:
 - If the suggestion only asks the user to verify or ensure a change done in the PR, it should not receive a score above 7 (and may be lower).
 - Error handling or type checking suggestions should not receive a score above 8 (and may be lower).
