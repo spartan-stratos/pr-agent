@@ -4,6 +4,7 @@ from typing import List
 
 from git import Repo
 
+from pr_agent.algo.file_filter import filter_ignored
 from pr_agent.algo.language_handler import build_language_file_matcher
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.algo.utils import format_pr_code_suggestions_header, show_run_details
@@ -129,6 +130,9 @@ class LocalGitProvider(GitProvider):
                               old_filename=None if diff_item.a_path == diff_item.b_path else diff_item.a_path
                               )
             )
+        # Unlike the github/gitlab/gitea/azure providers, get_diff_files() here never applied
+        # ignore.regex / ignore.glob, so those settings were silently dead in local mode.
+        diff_files = filter_ignored(diff_files)
         self.diff_files = diff_files
         return diff_files
 

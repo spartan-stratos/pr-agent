@@ -8,11 +8,24 @@ MODEL="${MODEL:-claude_cli/sonnet}"
 # No PR URL, no GitHub token, never posts - emits structured output to stdout.
 LOCAL_MODE=0
 PREVIEW_FLAG=""
+PER_MODULE_FLAG=0
 usage() {
     echo "Usage: $0 <pr-url> [review|improve] [--preview]" >&2
-    echo "       $0 --local [target] [review|improve]   (HEAD vs target, no PR, no post)" >&2
+    echo "       $0 --local [target] [review|improve] [--per-module]   (HEAD vs target, no PR, no post)" >&2
     exit 1
 }
+
+# Strip --per-module from anywhere in argv before positional parsing (local mode
+# only; github mode ignores the flag entirely - see the split-trigger check below).
+ARGS=()
+for _a in "$@"; do
+    if [ "$_a" = "--per-module" ]; then
+        PER_MODULE_FLAG=1
+    else
+        ARGS+=("$_a")
+    fi
+done
+if [ "${#ARGS[@]}" -gt 0 ]; then set -- "${ARGS[@]}"; else set --; fi
 
 if [ "${1:-}" = "--local" ]; then
     LOCAL_MODE=1
@@ -388,11 +401,14 @@ export PR_REVIEWER__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
 export PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
 echo "conventions: personal=$PERSONAL_CONVENTIONS_LOADED stacks=$STACKS_DISPLAY patterns=$PATTERNS_LOADED conv-chars=$CONV_CHARS_PRE/$CONV_CAP dropped=$CONV_TRUNC repo-AGENTS=$REPO_AGENTS_LOADED claude-md=$CLAUDE_MD_LOADED workspace-ctx=$WORKSPACE_CTX score-threshold=$PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD" >&2
 
-# Real diff size, used both for review-coverage accounting and the improve
-# empty-suggestions note below. Local mode only - TARGET is unset otherwise.
+# Real diff file list/size, used for review-coverage accounting, the improve
+# empty-suggestions note below, and (local mode) per-module splitting. Local
+# mode only - TARGET is unset otherwise.
+FILES_LIST=""
 TOTAL_DIFF_FILES=0
 if [ "$LOCAL_MODE" = "1" ]; then
-    TOTAL_DIFF_FILES="$(git diff --name-only "${TARGET}...HEAD" 2>/dev/null | grep -c . || true)"
+    FILES_LIST="$(git diff --name-only "${TARGET}...HEAD" 2>/dev/null || true)"
+    TOTAL_DIFF_FILES="$(printf '%s\n' "$FILES_LIST" | grep -c . || true)"
 fi
 
 # Committable suggestions only make sense when posting to a real PR (github mode).
@@ -401,12 +417,16 @@ if [ "$CMD" = "improve" ] && [ "$LOCAL_MODE" = "0" ]; then
     export PR_CODE_SUGGESTIONS__COMMITABLE_CODE_SUGGESTIONS=true
 fi
 
-# Local mode and --preview both produce structured stdout and never post.
-if [ "$LOCAL_MODE" = "1" ] || [ "$PREVIEW_FLAG" = "--preview" ]; then
-    export CONFIG__PUBLISH_OUTPUT=false
-    OUT_FILE="$(mktemp)"
+# run_pragent_pass <pr_url> <cmd> <total_diff_files> <out_file>
+# Runs one review/improve pass through the CLI-backed AI handler with
+# CONFIG__GIT_PROVIDER/CONFIG__MODEL already exported; writes stdout to
+# out_file and returns the python process's exit code. Shared by the
+# single-pass and per-module-split paths below.
+run_pragent_pass() {
+    local pr_url="$1" cmd="$2" total_diff_files="$3" out_file="$4"
+    local rc
     set +e
-    "$PY" - "$PR_URL" "$CMD" "$TOTAL_DIFF_FILES" <<'PY' > "$OUT_FILE"
+    "$PY" - "$pr_url" "$cmd" "$total_diff_files" <<'PY' > "$out_file"
 import asyncio
 import json
 import os
@@ -455,6 +475,114 @@ asyncio.run(main())
 PY
     rc=$?
     set -e
+    return $rc
+}
+
+# run_split_review_or_improve
+# Groups FILES_LIST via group_files_by_module, runs one run_pragent_pass per
+# group sequentially (IGNORE__REGEX scoped to that group's exact files), then
+# merges: review -> concatenated markdown under "## module: <g> (<n> files)"
+# headings plus one combined "coverage:" line; improve -> one merged JSON
+# object (code_suggestions arrays concatenated + deduped by
+# relevant_file+one_sentence_summary). A failing group is named and the
+# function returns non-zero; other groups still run.
+run_split_review_or_improve() {
+    local groups_tsv groups g files_g n_g pattern out_g rc_g
+    local -a failed_groups=()
+    groups_tsv="$(printf '%s\n' "$FILES_LIST" | grep -c . >/dev/null 2>&1; \
+        printf '%s\n' "$FILES_LIST" | group_files_by_module 3 3 "${PRAGENT_SPLIT_MAX_GROUPS:-6}")"
+    groups="$(printf '%s\n' "$groups_tsv" | cut -f1 | sort -u)"
+
+    if [ "$CMD" = "review" ]; then
+        local combined_md="" sum_reviewed=0 sum_total=0 not_reviewed_g reviewed_g pct
+        while IFS= read -r g; do
+            [ -z "$g" ] && continue
+            files_g="$(printf '%s\n' "$groups_tsv" | awk -F'\t' -v g="$g" '$1==g{print $2}')"
+            n_g="$(printf '%s\n' "$files_g" | grep -c .)"
+            pattern="$(printf '%s\n' "$files_g" | build_group_ignore_regex)"
+            export IGNORE__REGEX="['$pattern']"
+            out_g="$(mktemp)"
+            run_pragent_pass "$PR_URL" "$CMD" "$n_g" "$out_g"
+            rc_g=$?
+            [ "$rc_g" -ne 0 ] && failed_groups+=("$g")
+            not_reviewed_g="$(count_unreviewed_files "$(cat "$out_g")")"
+            reviewed_g=$(( n_g - not_reviewed_g ))
+            [ "$reviewed_g" -lt 0 ] && reviewed_g=0
+            sum_reviewed=$(( sum_reviewed + reviewed_g ))
+            sum_total=$(( sum_total + n_g ))
+            echo "module $g: reviewed=${reviewed_g}/${n_g}" >&2
+            combined_md+="## module: $g ($n_g files)"$'\n\n'"$(cat "$out_g")"$'\n\n'
+            rm -f "$out_g"
+        done <<< "$groups"
+        unset IGNORE__REGEX
+        printf '%s' "$combined_md"
+        pct=0
+        [ "$sum_total" -gt 0 ] && pct=$(( sum_reviewed * 100 / sum_total ))
+        echo "coverage: reviewed=${sum_reviewed}/${sum_total} (${pct}%)" >&2
+        if [ "$sum_total" -gt 0 ] && [ "$pct" -lt "${PRAGENT_MIN_COVERAGE:-70}" ]; then
+            echo "WARNING: low review coverage - split the diff or review per module" >&2
+        fi
+    else
+        local -a group_out_files=()
+        while IFS= read -r g; do
+            [ -z "$g" ] && continue
+            files_g="$(printf '%s\n' "$groups_tsv" | awk -F'\t' -v g="$g" '$1==g{print $2}')"
+            n_g="$(printf '%s\n' "$files_g" | grep -c .)"
+            pattern="$(printf '%s\n' "$files_g" | build_group_ignore_regex)"
+            export IGNORE__REGEX="['$pattern']"
+            out_g="$(mktemp)"
+            run_pragent_pass "$PR_URL" "$CMD" "$n_g" "$out_g"
+            rc_g=$?
+            if [ "$rc_g" -ne 0 ] || ! "$PY" -c "import json,sys; json.load(open(sys.argv[1]))" "$out_g" >/dev/null 2>&1; then
+                failed_groups+=("$g")
+                echo "module $g: FAILED (rc=$rc_g)" >&2
+            else
+                group_out_files+=("$out_g")
+                echo "module $g: ok" >&2
+            fi
+        done <<< "$groups"
+        unset IGNORE__REGEX
+        if [ "${#group_out_files[@]}" -gt 0 ]; then
+            jq -s '.[0] + {code_suggestions: ((map(.code_suggestions // []) | add // []) | unique_by([.relevant_file, .one_sentence_summary]))}' \
+                "${group_out_files[@]}"
+        else
+            echo '{"code_suggestions": []}'
+        fi
+        for out_g in "${group_out_files[@]:-}"; do
+            [ -n "$out_g" ] && rm -f "$out_g"
+        done
+    fi
+
+    if [ "${#failed_groups[@]}" -gt 0 ]; then
+        echo "ERROR: module(s) failed: ${failed_groups[*]}" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Per-module split trigger: explicit --per-module, or file count over
+# PRAGENT_SPLIT_THRESHOLD (default 25; 0 disables auto-splitting). Local
+# mode only - github mode must behave exactly as before.
+SPLIT_MODE=0
+PRAGENT_SPLIT_THRESHOLD="${PRAGENT_SPLIT_THRESHOLD:-25}"
+if [ "$LOCAL_MODE" = "1" ]; then
+    if [ "$PER_MODULE_FLAG" = "1" ]; then
+        SPLIT_MODE=1
+    elif [ "$PRAGENT_SPLIT_THRESHOLD" != "0" ] && [ "$TOTAL_DIFF_FILES" -gt "$PRAGENT_SPLIT_THRESHOLD" ]; then
+        SPLIT_MODE=1
+    fi
+fi
+
+# Local mode and --preview both produce structured stdout and never post.
+if [ "$LOCAL_MODE" = "1" ] && [ "$SPLIT_MODE" = "1" ]; then
+    export CONFIG__PUBLISH_OUTPUT=false
+    run_split_review_or_improve
+    exit $?
+elif [ "$LOCAL_MODE" = "1" ] || [ "$PREVIEW_FLAG" = "--preview" ]; then
+    export CONFIG__PUBLISH_OUTPUT=false
+    OUT_FILE="$(mktemp)"
+    run_pragent_pass "$PR_URL" "$CMD" "$TOTAL_DIFF_FILES" "$OUT_FILE"
+    rc=$?
     cat "$OUT_FILE"
     if [ "$LOCAL_MODE" = "1" ] && [ "$CMD" = "review" ]; then
         compute_review_coverage "$(cat "$OUT_FILE")" "$TOTAL_DIFF_FILES"
