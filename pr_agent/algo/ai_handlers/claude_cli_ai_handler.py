@@ -1,7 +1,9 @@
 import asyncio
 import json
 import shutil
+import sys
 import tempfile
+import time
 from asyncio.subprocess import PIPE
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
@@ -69,11 +71,20 @@ class ClaudeCliAIHandler(BaseAiHandler):
                 stdout=PIPE,
                 stderr=PIPE,
             )
+            _wall_start = time.monotonic()
             try:
                 stdout, stderr = await asyncio.wait_for(proc.communicate(user.encode()), timeout=self.timeout)
             except asyncio.TimeoutError as exc:
                 proc.kill()
+                print(
+                    f"claude_cli: model={alias} wall={time.monotonic() - _wall_start:.1f}s chars_in={len(user)}",
+                    file=sys.stderr,
+                )
                 raise TimeoutError("Claude CLI timed out") from exc
+            print(
+                f"claude_cli: model={alias} wall={time.monotonic() - _wall_start:.1f}s chars_in={len(user)}",
+                file=sys.stderr,
+            )
 
         if proc.returncode != 0:
             stderr_text = stderr.decode("utf-8", errors="replace")[:500]

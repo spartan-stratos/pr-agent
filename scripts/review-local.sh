@@ -2,6 +2,18 @@
 # Runs PR-Agent review/improve through the local Claude Code CLI handler (Max subscription, no API key).
 set -euo pipefail
 
+# _now / _phase: per-phase wall-clock timing to stderr. macOS bash 3.2 has no
+# $EPOCHREALTIME and no `date +%N`, so use perl's Time::HiRes for sub-second
+# resolution. Every new stderr line starts with "phase:" so the skill's
+# `^(coverage|WARNING)` grep never matches it.
+_now() { perl -MTime::HiRes=time -e 'printf "%.2f", time'; }
+_phase() {
+    local label="$1" start="$2" end
+    end="$(_now)"
+    awk -v s="$start" -v e="$end" -v l="$label" 'BEGIN{printf "phase: %s %.2fs\n", l, e-s}' >&2
+}
+SCRIPT_START="$(_now)"
+
 MODEL="${MODEL:-claude_cli/sonnet}"
 
 # Local self-review mode: diff HEAD vs a target branch with PR-Agent's LocalGitProvider.
@@ -9,21 +21,41 @@ MODEL="${MODEL:-claude_cli/sonnet}"
 LOCAL_MODE=0
 PREVIEW_FLAG=""
 PER_MODULE_FLAG=0
+IMPROVE_OUT=""
+REVIEW_OUT=""
 usage() {
     echo "Usage: $0 <pr-url> [review|improve] [--preview]" >&2
     echo "       $0 --local [target] [review|improve] [--per-module]   (HEAD vs target, no PR, no post)" >&2
+    echo "       $0 --local [target] both [--per-module] --improve-out <file> --review-out <file>" >&2
     exit 1
 }
 
-# Strip --per-module from anywhere in argv before positional parsing (local mode
-# only; github mode ignores the flag entirely - see the split-trigger check below).
+# Strip --per-module / --improve-out <file> / --review-out <file> from anywhere in
+# argv before positional parsing (local mode only; github mode ignores them - see
+# the split-trigger check below).
 ARGS=()
-for _a in "$@"; do
-    if [ "$_a" = "--per-module" ]; then
-        PER_MODULE_FLAG=1
-    else
-        ARGS+=("$_a")
-    fi
+_argv=("$@")
+_i=0
+_n="${#_argv[@]}"
+while [ "$_i" -lt "$_n" ]; do
+    _a="${_argv[$_i]}"
+    case "$_a" in
+        --per-module)
+            PER_MODULE_FLAG=1
+            ;;
+        --improve-out)
+            _i=$((_i + 1))
+            IMPROVE_OUT="${_argv[$_i]:-}"
+            ;;
+        --review-out)
+            _i=$((_i + 1))
+            REVIEW_OUT="${_argv[$_i]:-}"
+            ;;
+        *)
+            ARGS+=("$_a")
+            ;;
+    esac
+    _i=$((_i + 1))
 done
 if [ "${#ARGS[@]}" -gt 0 ]; then set -- "${ARGS[@]}"; else set --; fi
 
@@ -38,8 +70,18 @@ else
     [ -z "$PR_URL" ] && usage
 fi
 
-if [ "$CMD" != "review" ] && [ "$CMD" != "improve" ]; then
+if [ "$CMD" != "review" ] && [ "$CMD" != "improve" ] && [ "$CMD" != "both" ]; then
     usage
+fi
+if [ "$CMD" = "both" ]; then
+    if [ "$LOCAL_MODE" != "1" ]; then
+        echo "both mode is local-only: use --local <target> both" >&2
+        exit 1
+    fi
+    if [ -z "$IMPROVE_OUT" ] || [ -z "$REVIEW_OUT" ]; then
+        echo "both mode requires --improve-out <file> and --review-out <file>" >&2
+        exit 1
+    fi
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -133,6 +175,7 @@ else
     export GITHUB__USER_TOKEN="$(gh auth token)"
     export CONFIG__GIT_PROVIDER=github
 fi
+_phase preflight "$SCRIPT_START"
 export CONFIG__MODEL="$MODEL"
 export CONFIG__FALLBACK_MODELS="[\"$MODEL\"]"
 
@@ -189,6 +232,7 @@ if [[ "$PR_URL" == https://github.com/*/pull/* ]]; then
     fi
 fi
 
+_conv_start="$(_now)"
 PERSONAL_CONVENTIONS_LOADED=no
 REPO_AGENTS_LOADED=no
 CLAUDE_MD_LOADED=no
@@ -369,6 +413,7 @@ fi
 # rules so the 9000-char cap prioritizes conventions; code-context fills the remainder.
 # Best-effort: never fail the review. Disable with PRAGENT_WORKSPACE_INDEX=0.
 WORKSPACE_CTX=none
+_wi_start="$(_now)"
 if [ "$LOCAL_MODE" = "1" ] && [ "${PRAGENT_WORKSPACE_INDEX:-1}" != "0" ]; then
     WI_ERR="$(mktemp)"
     if WI_OUT="$("$ROOT/scripts/workspace-index.sh" "$TARGET" 2>"$WI_ERR")" && [ -n "$WI_OUT" ]; then
@@ -381,6 +426,7 @@ if [ "$LOCAL_MODE" = "1" ] && [ "${PRAGENT_WORKSPACE_INDEX:-1}" != "0" ]; then
     fi
     rm -f "$WI_ERR"
 fi
+_phase workspace-index "$_wi_start"
 
 # Truncation is head-keep, so anything appended late is silently dropped. That is how the entire
 # patterns tier used to vanish while the summary line still reported it as loaded. Report the
@@ -400,6 +446,7 @@ fi
 export PR_REVIEWER__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
 export PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
 echo "conventions: personal=$PERSONAL_CONVENTIONS_LOADED stacks=$STACKS_DISPLAY patterns=$PATTERNS_LOADED conv-chars=$CONV_CHARS_PRE/$CONV_CAP dropped=$CONV_TRUNC repo-AGENTS=$REPO_AGENTS_LOADED claude-md=$CLAUDE_MD_LOADED workspace-ctx=$WORKSPACE_CTX score-threshold=$PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD" >&2
+_phase conventions "$_conv_start"
 
 # Real diff file list/size, used for review-coverage accounting, the improve
 # empty-suggestions note below, and (local mode) per-module splitting. Local
@@ -424,7 +471,8 @@ fi
 # single-pass and per-module-split paths below.
 run_pragent_pass() {
     local pr_url="$1" cmd="$2" total_diff_files="$3" out_file="$4"
-    local rc
+    local rc _pp_start
+    _pp_start="$(_now)"
     set +e
     "$PY" - "$pr_url" "$cmd" "$total_diff_files" <<'PY' > "$out_file"
 import asyncio
@@ -475,6 +523,7 @@ asyncio.run(main())
 PY
     rc=$?
     set -e
+    _phase "pragent-pass cmd=$cmd files=$total_diff_files" "$_pp_start"
     return $rc
 }
 
@@ -573,11 +622,68 @@ if [ "$LOCAL_MODE" = "1" ]; then
     fi
 fi
 
+# both: improve and review off ONE pre-flight/conventions/workspace-index.
+# Split mode runs them sequentially, not concurrently: each split pass already fires one model
+# call per module group, so overlapping would multiply concurrent calls by the group count.
+# run_split_review_or_improve reads the global CMD and prints to stdout, and mutates an exported
+# IGNORE__REGEX - hence the per-pass subshell, which contains both.
+if [ "$CMD" = "both" ]; then
+    export CONFIG__PUBLISH_OUTPUT=false
+    IMPROVE_ERRF="$(mktemp)"
+    REVIEW_ERRF="$(mktemp)"
+    IMPROVE_RC=0
+    REVIEW_RC=0
+    if [ "$SPLIT_MODE" = "1" ]; then
+        GROUP_COUNT="$(printf '%s\n' "$FILES_LIST" \
+            | group_files_by_module 3 3 "${PRAGENT_SPLIT_MAX_GROUPS:-6}" \
+            | cut -f1 | sort -u | grep -c . || true)"
+        echo "phase: both mode=split-sequential groups=${GROUP_COUNT:-0}" >&2
+        ( CMD=improve; run_split_review_or_improve > "$IMPROVE_OUT" ) 2>"$IMPROVE_ERRF" || IMPROVE_RC=$?
+        ( CMD=review; run_split_review_or_improve > "$REVIEW_OUT" ) 2>"$REVIEW_ERRF" || REVIEW_RC=$?
+    else
+        echo "phase: both mode=concurrent" >&2
+        ( run_pragent_pass "$PR_URL" "improve" "$TOTAL_DIFF_FILES" "$IMPROVE_OUT" ) 2>"$IMPROVE_ERRF" &
+        IMPROVE_PID=$!
+        ( run_pragent_pass "$PR_URL" "review" "$TOTAL_DIFF_FILES" "$REVIEW_OUT" ) 2>"$REVIEW_ERRF" &
+        REVIEW_PID=$!
+        # set -e does not propagate out of a backgrounded subshell, so a failing pass never
+        # kills the script here - collect each rc explicitly via wait, guarded by `||` so a
+        # nonzero wait does not itself trip this script's own set -e.
+        wait "$IMPROVE_PID" || IMPROVE_RC=$?
+        wait "$REVIEW_PID" || REVIEW_RC=$?
+    fi
+    cat "$IMPROVE_ERRF" >&2
+    cat "$REVIEW_ERRF" >&2
+    rm -f "$IMPROVE_ERRF" "$REVIEW_ERRF"
+    # In split mode run_split_review_or_improve already printed its own "coverage:" line
+    # (captured above into REVIEW_ERRF and cat'd to stderr); computing it again here would
+    # double-print and would be wrong anyway (the single-pass total_diff_files coverage
+    # math does not apply to a merged multi-group markdown).
+    if [ "$SPLIT_MODE" != "1" ] && [ "$REVIEW_RC" -eq 0 ] && [ -f "$REVIEW_OUT" ]; then
+        compute_review_coverage "$(cat "$REVIEW_OUT")" "$TOTAL_DIFF_FILES"
+    fi
+    _phase total "$SCRIPT_START"
+    BOTH_RC=0
+    if [ "$IMPROVE_RC" -ne 0 ] && [ "$REVIEW_RC" -ne 0 ]; then
+        echo "ERROR: both improve and review passes failed (improve rc=$IMPROVE_RC, review rc=$REVIEW_RC)" >&2
+        BOTH_RC=1
+    elif [ "$IMPROVE_RC" -ne 0 ]; then
+        echo "ERROR: improve pass failed (rc=$IMPROVE_RC)" >&2
+        BOTH_RC=1
+    elif [ "$REVIEW_RC" -ne 0 ]; then
+        echo "ERROR: review pass failed (rc=$REVIEW_RC)" >&2
+        BOTH_RC=1
+    fi
+    exit $BOTH_RC
+fi
+
 # Local mode and --preview both produce structured stdout and never post.
 if [ "$LOCAL_MODE" = "1" ] && [ "$SPLIT_MODE" = "1" ]; then
     export CONFIG__PUBLISH_OUTPUT=false
     run_split_review_or_improve
-    exit $?
+    rc=$?
+    _phase total "$SCRIPT_START"
+    exit $rc
 elif [ "$LOCAL_MODE" = "1" ] || [ "$PREVIEW_FLAG" = "--preview" ]; then
     export CONFIG__PUBLISH_OUTPUT=false
     OUT_FILE="$(mktemp)"
@@ -588,6 +694,7 @@ elif [ "$LOCAL_MODE" = "1" ] || [ "$PREVIEW_FLAG" = "--preview" ]; then
         compute_review_coverage "$(cat "$OUT_FILE")" "$TOTAL_DIFF_FILES"
     fi
     rm -f "$OUT_FILE"
+    _phase total "$SCRIPT_START"
     exit $rc
 else
     export CONFIG__PUBLISH_OUTPUT=true
@@ -609,7 +716,9 @@ else
         "$PY" "$ROOT/scripts/post-dropped-suggestions.py" "$PR_URL" "$ERRLOG" || true
         "$ROOT/scripts/suppress.sh" post-improve --pr-url "$PR_URL" || true
         rm -f "$ERRLOG"
+        _phase total "$SCRIPT_START"
         exit $rc
     fi
+    _phase total "$SCRIPT_START"
     exec "$PY" -m pr_agent.cli --pr_url "$PR_URL" "$CMD"
 fi
