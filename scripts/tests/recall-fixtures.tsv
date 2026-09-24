@@ -1,0 +1,7 @@
+# recall-harness fixture table. Tab-separated.
+# columns: name  repo_path  ref  base  passes  expect_regex
+#   ref   - commit-ish carrying the defect
+#   base  - what ref is diffed against
+#   passes      - comma list from {review,improve}
+#   expect_regex - ERE, matched case-insensitively against that pass's output
+slug32-bound	/Users/ducduong/workspace/personal-workflow-automate	ducdt/4378-review-local-latency	master	review,improve	(32[- ]char|truncat|slice|exceed|bound|cap)
