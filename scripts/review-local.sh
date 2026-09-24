@@ -622,6 +622,90 @@ if [ "$LOCAL_MODE" = "1" ]; then
     fi
 fi
 
+# review-union: K independent `review` passes unioned, so a defect only one
+# pass notices still reaches the reader (measured ~23% single-pass recall).
+# Default 1 = current behaviour, byte-identical - this runs on every review.
+REVIEW_UNION_K_RAW="${PRAGENT_REVIEW_UNION_K:-1}"
+case "$REVIEW_UNION_K_RAW" in
+    ''|*[!0-9]*) REVIEW_UNION_K=1 ;;
+    *) REVIEW_UNION_K="$REVIEW_UNION_K_RAW" ;;
+esac
+# Unbounded K risks CLI rate limits from concurrent `claude` processes.
+if [ "$REVIEW_UNION_K" -lt 1 ]; then
+    REVIEW_UNION_K=1
+elif [ "$REVIEW_UNION_K" -gt 8 ]; then
+    echo "review-union: K clamped to 8" >&2
+    REVIEW_UNION_K=8
+fi
+
+# run_review_union <pr_url> <total_diff_files> <out_file>
+# K=1 or split mode: falls straight through to a single run_pragent_pass
+# call, byte-identical to pre-union behaviour, no extra stderr.
+run_review_union() {
+    local pr_url="$1" total_diff_files="$2" out_file="$3"
+    local k="$REVIEW_UNION_K"
+
+    if [ "$k" -le 1 ]; then
+        run_pragent_pass "$pr_url" "review" "$total_diff_files" "$out_file"
+        return $?
+    fi
+    # Split mode already fires one model call per module group; K on top
+    # would multiply that by K, so union is off there.
+    if [ "$SPLIT_MODE" = "1" ]; then
+        echo "review-union: disabled in split mode" >&2
+        run_pragent_pass "$pr_url" "review" "$total_diff_files" "$out_file"
+        return $?
+    fi
+
+    local i pid rc succeeded=0
+    local -a pids=() tmp_outs=() rcs=()
+    for ((i = 1; i <= k; i++)); do
+        local t_out
+        t_out="$(mktemp)"
+        tmp_outs+=("$t_out")
+        ( run_pragent_pass "$pr_url" "review" "$total_diff_files" "$t_out" ) &
+        pids+=("$!")
+    done
+
+    # set -e does not propagate out of a backgrounded subshell; each pass's
+    # rc must be collected explicitly via wait.
+    for pid in "${pids[@]}"; do
+        rc=0
+        wait "$pid" || rc=$?
+        rcs+=("$rc")
+    done
+
+    # Union, never a merge: no dedup, no reconciliation between passes. A
+    # pass that found nothing still gets its heading so the reader sees K
+    # passes ran; a FAILED pass is named, not silently read as "found
+    # nothing" - the recall harness's error-vs-miss accounting depends on it.
+    : > "$out_file"
+    for ((i = 1; i <= k; i++)); do
+        rc="${rcs[$((i - 1))]}"
+        {
+            echo "## review pass $i of $k"
+            echo
+            if [ "$rc" -ne 0 ]; then
+                echo "review-union: pass $i of $k FAILED (rc=$rc) - no output from this pass."
+            else
+                cat "${tmp_outs[$((i - 1))]}"
+                succeeded=$((succeeded + 1))
+            fi
+            echo
+        } >> "$out_file"
+        [ "$rc" -ne 0 ] && echo "review-union: pass $i of $k failed rc=$rc" >&2
+        rm -f "${tmp_outs[$((i - 1))]}"
+    done
+
+    echo "review-union: $succeeded of $k passes succeeded" >&2
+    echo "phase: review-union k=$k succeeded=$succeeded" >&2
+
+    # Exit non-zero only if every pass failed; a partial failure is a
+    # usable union with fewer passes.
+    [ "$succeeded" -eq 0 ] && return 1
+    return 0
+}
+
 # both: improve and review off ONE pre-flight/conventions/workspace-index.
 # Split mode runs them sequentially, not concurrently: each split pass already fires one model
 # call per module group, so overlapping would multiply concurrent calls by the group count.
@@ -638,13 +722,16 @@ if [ "$CMD" = "both" ]; then
             | group_files_by_module 3 3 "${PRAGENT_SPLIT_MAX_GROUPS:-6}" \
             | cut -f1 | sort -u | grep -c . || true)"
         echo "phase: both mode=split-sequential groups=${GROUP_COUNT:-0}" >&2
+        if [ "$REVIEW_UNION_K" -gt 1 ]; then
+            echo "review-union: disabled in split mode" >&2
+        fi
         ( CMD=improve; run_split_review_or_improve > "$IMPROVE_OUT" ) 2>"$IMPROVE_ERRF" || IMPROVE_RC=$?
         ( CMD=review; run_split_review_or_improve > "$REVIEW_OUT" ) 2>"$REVIEW_ERRF" || REVIEW_RC=$?
     else
         echo "phase: both mode=concurrent" >&2
         ( run_pragent_pass "$PR_URL" "improve" "$TOTAL_DIFF_FILES" "$IMPROVE_OUT" ) 2>"$IMPROVE_ERRF" &
         IMPROVE_PID=$!
-        ( run_pragent_pass "$PR_URL" "review" "$TOTAL_DIFF_FILES" "$REVIEW_OUT" ) 2>"$REVIEW_ERRF" &
+        ( run_review_union "$PR_URL" "$TOTAL_DIFF_FILES" "$REVIEW_OUT" ) 2>"$REVIEW_ERRF" &
         REVIEW_PID=$!
         # set -e does not propagate out of a backgrounded subshell, so a failing pass never
         # kills the script here - collect each rc explicitly via wait, guarded by `||` so a
@@ -680,6 +767,9 @@ fi
 # Local mode and --preview both produce structured stdout and never post.
 if [ "$LOCAL_MODE" = "1" ] && [ "$SPLIT_MODE" = "1" ]; then
     export CONFIG__PUBLISH_OUTPUT=false
+    if [ "$CMD" = "review" ] && [ "$REVIEW_UNION_K" -gt 1 ]; then
+        echo "review-union: disabled in split mode" >&2
+    fi
     run_split_review_or_improve
     rc=$?
     _phase total "$SCRIPT_START"
@@ -687,7 +777,11 @@ if [ "$LOCAL_MODE" = "1" ] && [ "$SPLIT_MODE" = "1" ]; then
 elif [ "$LOCAL_MODE" = "1" ] || [ "$PREVIEW_FLAG" = "--preview" ]; then
     export CONFIG__PUBLISH_OUTPUT=false
     OUT_FILE="$(mktemp)"
-    run_pragent_pass "$PR_URL" "$CMD" "$TOTAL_DIFF_FILES" "$OUT_FILE"
+    if [ "$LOCAL_MODE" = "1" ] && [ "$CMD" = "review" ]; then
+        run_review_union "$PR_URL" "$TOTAL_DIFF_FILES" "$OUT_FILE"
+    else
+        run_pragent_pass "$PR_URL" "$CMD" "$TOTAL_DIFF_FILES" "$OUT_FILE"
+    fi
     rc=$?
     cat "$OUT_FILE"
     if [ "$LOCAL_MODE" = "1" ] && [ "$CMD" = "review" ]; then

@@ -96,17 +96,39 @@ knob_temperature() {
     fi
 }
 
-echo "knobs: $(knob_from_shell_default PRAGENT_CONV_CAP "$ROOT/scripts/review-local.sh") $(knob_temperature) $(knob_from_shell_default PRAGENT_SPLIT_THRESHOLD "$ROOT/scripts/review-local.sh")"
+echo "knobs: $(knob_from_shell_default PRAGENT_CONV_CAP "$ROOT/scripts/review-local.sh") $(knob_temperature) $(knob_from_shell_default PRAGENT_SPLIT_THRESHOLD "$ROOT/scripts/review-local.sh") $(knob_from_shell_default PRAGENT_REVIEW_UNION_K "$ROOT/scripts/review-local.sh")"
 
 TOTAL_FOUND=0
 TOTAL_ATTEMPTED=0
 TOTAL_ERRORS=0
 
-# review hit = expect_regex matches the markdown AND the markdown does not
-# say "No major issues detected" - the regex alone could match boilerplate.
+# Scored PER SECTION (split on "## review pass " headings; a file with none is
+# one section, which is what keeps K=1 scoring untouched) then OR'd together.
+# A file-wide check was tried first and is wrong: a K-pass union usually has at
+# least one miss-phrase section even when another genuinely found the defect, so
+# it demands all K sub-passes hit at once - inverting a union into an
+# all-K-must-hit test. Do not "simplify" this back.
 review_hit() {
     local out_file="$1" expect="$2"
-    grep -qEi "$expect" "$out_file" && ! grep -q "No major issues detected" "$out_file"
+    local sections_dir sec_file hit=1
+
+    if grep -q '^## review pass ' "$out_file"; then
+        sections_dir="$(mktemp -d)"
+        awk -v dir="$sections_dir" 'BEGIN{n=0} /^## review pass /{n++} {print > (dir "/sec-" n)}' "$out_file"
+        for sec_file in "$sections_dir"/sec-*; do
+            [ -f "$sec_file" ] || continue
+            if grep -qEi "$expect" "$sec_file" && ! grep -q "No major issues detected" "$sec_file"; then
+                hit=0
+                break
+            fi
+        done
+        rm -rf "$sections_dir"
+    else
+        if grep -qEi "$expect" "$out_file" && ! grep -q "No major issues detected" "$out_file"; then
+            hit=0
+        fi
+    fi
+    return "$hit"
 }
 
 # improve hit = the JSON parses AND some code_suggestions element has a
@@ -136,7 +158,7 @@ PYEOF
 run_pass() {
     local fixture="$1" worktree="$2" base="$3" pass="$4" expect="$5" n="$6"
     local found=0 errors=0 i out_file err_file rc start end elapsed last_err
-    local times=()
+    local times=() last_sections=0
 
     for i in $(seq 1 "$n"); do
         echo "fixture $fixture pass $pass iter $i/$n" >&2
@@ -149,6 +171,11 @@ run_pass() {
         end="$(_now)"
         elapsed="$(awk -v s="$start" -v e="$end" 'BEGIN{printf "%.0f", e-s}')"
         times+=("$elapsed")
+
+        # Ground truth for whether union actually ran, from the LAST iteration's
+        # output - 0 means either K=1 (no headings expected) or the env var
+        # never reached the wrapper (headings expected but absent).
+        last_sections="$(grep -c '^## review pass ' "$out_file" 2>/dev/null || true)"
 
         if [ "$rc" -ne 0 ]; then
             # An error means the measurement did not happen, not that recall
@@ -177,7 +204,7 @@ run_pass() {
     local attempted=$((n - errors))
     local rate="n/a"
     [ "$attempted" -gt 0 ] && rate=$((found * 100 / attempted))
-    echo "recall fixture=$fixture pass=$pass n=$n attempted=$attempted found=$found errors=$errors rate=$rate wall_median=$median wall_max=$max"
+    echo "recall fixture=$fixture pass=$pass n=$n attempted=$attempted found=$found errors=$errors rate=$rate wall_median=$median wall_max=$max sections_observed=$last_sections"
 
     TOTAL_FOUND=$((TOTAL_FOUND + found))
     TOTAL_ATTEMPTED=$((TOTAL_ATTEMPTED + attempted))
