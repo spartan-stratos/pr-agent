@@ -5,3 +5,5 @@
 #   passes      - comma list from {review,improve}
 #   expect_regex - ERE, matched case-insensitively against that pass's output
 slug32-bound	/Users/ducduong/workspace/personal-workflow-automate	ducdt/4378-review-local-latency	master	review,improve	(32[- ]char|truncat|slice|exceed|bound|cap)
+verdict-argswap	/Users/ducduong/workspace/personal-workflow-automate	ducdt/4613-fixture-verdict-argswap	master	review,improve	(swap|revers|transpos).{0,40}(argument|param|order)|(argument|param|order).{0,40}(swap|revers|transpos)|caller.{0,60}(pass|invok|call).{0,40}(wrong|backward|revers|invert)|invert(ed|s)?.{0,40}(verdict|comparison|argument|order)
+corpus-swallow	/Users/ducduong/workspace/personal-workflow-automate	ducdt/4613-fixture-corpus-swallow	master	review,improve	(swallow|silently (skip|ignor|drop))|empty catch|catch.{0,30}continue.{0,30}(no log|silent)|mask(ed|s)?.{0,20}(failure|error)|(hides?|hiding).{0,30}(malformed|invalid|bad).{0,30}(task|director)
