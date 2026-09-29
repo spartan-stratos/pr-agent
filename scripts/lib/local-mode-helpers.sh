@@ -133,3 +133,36 @@ build_group_ignore_regex() {
     done
     printf '^(?!(?:%s)$).*' "$alt"
 }
+
+# make_review_base_ref <short-sha>
+# Generates a unique temp ref name by appending the current process ID to avoid
+# collisions when multiple review-local runs target the same base commit.
+# Prints "review-base-<short-sha>-<pid>".
+make_review_base_ref() {
+    local short_sha="$1"
+    printf 'review-base-%s-%d' "$short_sha" "$$"
+}
+
+# prune_stale_review_base_refs
+# Removes abandoned review-base-* refs from prior runs whose PID no longer exists,
+# and legacy refs without a -<pid> suffix. Never deletes a ref whose PID is alive.
+# Silently does nothing if no such refs exist. Returns 0 always.
+prune_stale_review_base_refs() {
+    local ref pid
+    git for-each-ref 'refs/heads/review-base-*' --format='%(refname:short)' |
+    while IFS= read -r ref; do
+        # Extract the trailing segment after the last hyphen.
+        pid="${ref##*-}"
+        # A valid modern ref has form review-base-<sha>-<digits>. If the trailing
+        # segment is NOT all digits, or the ref doesn't match the expected pattern,
+        # it's a legacy ref without a pid suffix - delete it.
+        if ! [[ "$pid" =~ ^[0-9]+$ ]] || ! [[ "$ref" =~ ^review-base-.+-[0-9]+$ ]]; then
+            # Legacy ref with no pid suffix or unexpected format.
+            git branch -D "$ref" >/dev/null 2>&1 || true
+        elif ! kill -0 "$pid" 2>/dev/null; then
+            # PID extracted, matches pattern, but the process is not alive.
+            git branch -D "$ref" >/dev/null 2>&1 || true
+        fi
+    done
+    return 0
+}

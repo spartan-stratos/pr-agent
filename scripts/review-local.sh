@@ -162,7 +162,9 @@ if [ "$LOCAL_MODE" = "1" ]; then
     PR_URL="$TARGET"
     case "$TARGET" in
       */*)
-        TMP_BASE_REF="review-base-$(git rev-parse --short "${TARGET}^{commit}")"
+        prune_stale_review_base_refs
+        short_sha="$(git rev-parse --short "${TARGET}^{commit}")"
+        TMP_BASE_REF="$(make_review_base_ref "$short_sha")"
         git branch -f "$TMP_BASE_REF" "${TARGET}^{commit}" >/dev/null 2>&1 || {
             echo "Could not create temp base ref for '$TARGET'." >&2; exit 1; }
         # shellcheck disable=SC2064  # expand TMP_BASE_REF now: it is stable for this run.

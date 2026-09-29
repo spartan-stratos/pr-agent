@@ -129,4 +129,76 @@ out="$(printf '%s\n' 'a/mod+ule/x/A.kt' 'a/b/c/B.kt' | build_group_ignore_regex)
 assert_eq "build_group_ignore_regex escapes and alternates group files" \
     '^(?!(?:a/mod\+ule/x/A\.kt|a/b/c/B\.kt)$).*' "$out"
 
+# --- make_review_base_ref and prune_stale_review_base_refs ---
+
+# Create a throwaway git repo for ref tests.
+GITDIR="$(mktemp -d)"
+trap 'rm -rf "$GITDIR"' EXIT
+cd "$GITDIR"
+git init -q
+git config user.email "test@example.com"
+git config user.name "Test User"
+echo "content" > file.txt
+git add file.txt
+git commit -q -m "initial"
+
+# Test: two calls in different processes yield different ref names.
+# Source the helpers in separate bash processes to get different PIDs.
+ref1="$(bash -c "source '$ROOT/scripts/lib/local-mode-helpers.sh'; make_review_base_ref abc1234")"
+ref2="$(bash -c "source '$ROOT/scripts/lib/local-mode-helpers.sh'; make_review_base_ref abc1234")"
+if [ "$ref1" != "$ref2" ]; then
+    echo "PASS: different processes yield different ref names"
+else
+    echo "FAIL: different processes should yield different ref names"
+    echo "  ref1: $ref1"
+    echo "  ref2: $ref2"
+    fail=1
+fi
+
+# Test: prune_stale_review_base_refs deletes a legacy ref with no -<pid> suffix.
+git branch -q review-base-legacy-only
+prune_stale_review_base_refs
+if git branch | grep -q "review-base-legacy-only"; then
+    echo "FAIL: legacy ref without -<pid> suffix should be pruned"
+    fail=1
+else
+    echo "PASS: legacy ref without -<pid> suffix is pruned"
+fi
+
+# Test: prune_stale_review_base_refs deletes a ref whose pid is not alive.
+# Use a very high PID that is extremely unlikely to be running.
+git branch -q review-base-deadpid-999999999
+prune_stale_review_base_refs
+if git branch | grep -q "review-base-deadpid-999999999"; then
+    echo "FAIL: ref with dead PID should be pruned"
+    fail=1
+else
+    echo "PASS: ref with dead PID is pruned"
+fi
+
+# Test: prune_stale_review_base_refs does NOT delete a ref whose pid is alive.
+# Create a ref with the current process's PID.
+current_pid=$$
+git branch -q "review-base-alive-$current_pid"
+prune_stale_review_base_refs
+if git branch | grep -q "review-base-alive-$current_pid"; then
+    echo "PASS: ref with live PID is not pruned"
+else
+    echo "FAIL: ref with live PID should not be pruned"
+    fail=1
+fi
+
+# Test: an all-digits legacy ref (review-base-<alldigits>, no -pid suffix) is pruned.
+# The sha must be a LIVE pid ($$), or the case cannot tell the implementations apart:
+# a naive check falls through to kill -0, and a dead pid is pruned either way, so the
+# test would pass against the very bug it exists to catch.
+git branch -q "review-base-$$"
+prune_stale_review_base_refs
+if git branch | grep -q "review-base-$$\b"; then
+    echo "FAIL: all-digits legacy ref should be pruned"
+    fail=1
+else
+    echo "PASS: all-digits legacy ref is pruned"
+fi
+
 exit $fail
