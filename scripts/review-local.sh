@@ -545,7 +545,7 @@ run_split_review_or_improve() {
     groups="$(printf '%s\n' "$groups_tsv" | cut -f1 | sort -u)"
 
     if [ "$CMD" = "review" ]; then
-        local combined_md="" sum_reviewed=0 sum_total=0 not_reviewed_g reviewed_g pct
+        local combined_md="" sum_reviewed=0 sum_total=0 reviewed_g pct
         while IFS= read -r g; do
             [ -z "$g" ] && continue
             files_g="$(printf '%s\n' "$groups_tsv" | awk -F'\t' -v g="$g" '$1==g{print $2}')"
@@ -556,9 +556,7 @@ run_split_review_or_improve() {
             run_pragent_pass "$PR_URL" "$CMD" "$n_g" "$out_g"
             rc_g=$?
             [ "$rc_g" -ne 0 ] && failed_groups+=("$g")
-            not_reviewed_g="$(count_unreviewed_files "$(cat "$out_g")")"
-            reviewed_g=$(( n_g - not_reviewed_g ))
-            [ "$reviewed_g" -lt 0 ] && reviewed_g=0
+            reviewed_g="$(reviewed_count "$rc_g" "$(cat "$out_g")" "$n_g")"
             sum_reviewed=$(( sum_reviewed + reviewed_g ))
             sum_total=$(( sum_total + n_g ))
             echo "module $g: reviewed=${reviewed_g}/${n_g}" >&2
@@ -786,7 +784,7 @@ elif [ "$LOCAL_MODE" = "1" ] || [ "$PREVIEW_FLAG" = "--preview" ]; then
     fi
     rc=$?
     cat "$OUT_FILE"
-    if [ "$LOCAL_MODE" = "1" ] && [ "$CMD" = "review" ]; then
+    if [ "$LOCAL_MODE" = "1" ] && [ "$CMD" = "review" ] && [ "$rc" -eq 0 ]; then
         compute_review_coverage "$(cat "$OUT_FILE")" "$TOTAL_DIFF_FILES"
     fi
     rm -f "$OUT_FILE"
