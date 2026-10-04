@@ -30,6 +30,21 @@ count_unreviewed_files() {
     printf '%s\n' "$not_reviewed"
 }
 
+# reviewed_count <rc> <markdown_text> <n_files>
+# Files a pass actually reviewed. A failed pass (rc != 0) emits no "Review
+# coverage" footer, which count_unreviewed_files reads as "nothing skipped" -
+# so without the rc check a dead pass scores as fully reviewed.
+reviewed_count() {
+    local rc="$1" markdown="$2" n_files="$3" reviewed
+    if [ "$rc" -ne 0 ]; then
+        printf '0\n'
+        return 0
+    fi
+    reviewed=$(( n_files - $(count_unreviewed_files "$markdown") ))
+    [ "$reviewed" -lt 0 ] && reviewed=0
+    printf '%s\n' "$reviewed"
+}
+
 # compute_review_coverage <markdown_text> <total_files>
 # Compares count_unreviewed_files() against the real diff file count and
 # warns on stderr when coverage is low. Warn-only: always returns 0.

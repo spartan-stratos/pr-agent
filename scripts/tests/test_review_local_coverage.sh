@@ -201,4 +201,24 @@ else
     echo "PASS: all-digits legacy ref is pruned"
 fi
 
+# reviewed_count: a failed pass (rc != 0) emits no coverage footer, so it must
+# score 0 reviewed rather than "n files minus 0 unreviewed".
+check_reviewed() {
+    local label="$1" want="$2" got
+    shift 2
+    got="$(reviewed_count "$@" 2>&1)"
+    if [ "$got" = "$want" ]; then
+        echo "PASS: $label"
+    else
+        echo "FAIL: $label (want '$want', got '$got')"
+        fail=1
+    fi
+}
+cov_md=$'Review coverage: 2 of 5 files not reviewed\n- `a.py`\n- `b.py`\n'
+check_reviewed "reviewed_count: rc=1 scores 0" 0 1 "" 5
+check_reviewed "reviewed_count: rc=1 ignores a coverage footer too" 0 1 "$cov_md" 5
+check_reviewed "reviewed_count: rc=0 no footer scores n" 5 0 "" 5
+check_reviewed "reviewed_count: rc=0 footer subtracts listed files" 3 0 "$cov_md" 5
+check_reviewed "reviewed_count: rc=0 floors at 0" 0 0 "$cov_md" 1
+
 exit $fail
