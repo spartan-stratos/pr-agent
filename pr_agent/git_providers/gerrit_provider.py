@@ -9,6 +9,7 @@ import uuid
 from collections import Counter, namedtuple
 from pathlib import Path
 from tempfile import NamedTemporaryFile, mkdtemp
+from typing import Optional
 
 import requests
 import urllib3.util
@@ -214,9 +215,15 @@ def upload_patch(patch, path):
 class GerritProvider(GitProvider):
 
     def __init__(self, key: str, incremental=False):
+        self.repo_path = None
         self.project, self.refspec = key.split(':')
         assert self.project, "Project name is required"
         assert self.refspec, "Refspec is required"
+
+        if not re.fullmatch(r"refs/changes/[0-9]{2}/[0-9]+/[0-9]+", self.refspec):
+            raise ValueError(
+                "Gerrit refspec must match refs/changes/NN/<change>/<patchset>"
+            )
         base_url = get_settings().get('gerrit.url')
         assert base_url, "Gerrit URL is required"
         user = get_settings().get('gerrit.user')
@@ -241,21 +248,19 @@ class GerritProvider(GitProvider):
         """
         return self.repo.branches[0].name
 
-    def get_issue_comments(self):
-        comments = list_comments(self.parsed_url, self.refspec)
-        Comments = namedtuple('Comments', ['reversed'])
+    def get_issue_comments(self) -> list:
         Comment = namedtuple('Comment', ['body'])
-        return Comments([Comment(c['message']) for c in reversed(comments)])
+        return [Comment(c['message']) for c in list_comments(self.parsed_url, self.refspec)]
 
     def get_pr_labels(self, update=False):
         raise NotImplementedError(
             'Getting labels is not implemented for the gerrit provider')
 
-    def add_eyes_reaction(self, issue_comment_id: int, disable_eyes: bool = False):
+    def add_eyes_reaction(self, issue_comment_id: int, disable_eyes: bool = False) -> Optional[int]:
         raise NotImplementedError(
             'Adding reactions is not implemented for the gerrit provider')
 
-    def remove_reaction(self, issue_comment_id: int, reaction_id: int):
+    def remove_reaction(self, issue_comment_id: int, reaction_id: int) -> bool:
         raise NotImplementedError(
             'Removing reactions is not implemented for the gerrit provider')
 
@@ -388,8 +393,10 @@ class GerritProvider(GitProvider):
             '\n'.join(context) + '\n' if context else ''
         )
 
-    def publish_code_suggestions(self, code_suggestions: list):
+    def publish_code_suggestions(self, code_suggestions: list) -> bool:
         msg = []
+        publishable_count = 0
+        published_count = 0
         repo_root = pathlib.Path(self.repo_path).resolve()
         for suggestion in code_suggestions:
             # Validate suggestion structure before accessing keys
@@ -403,6 +410,8 @@ class GerritProvider(GitProvider):
             except ValueError:
                 get_logger().warning(f"Skipping suggestion with path traversal: {suggestion['relevant_file']}")
                 continue
+
+            publishable_count += 1
             description, code = self.split_suggestion(suggestion['body'])
             add_suggestion(
                 target_path,
@@ -418,13 +427,21 @@ class GerritProvider(GitProvider):
             msg.append(f'* {description}\n{full_path}')
 
         if msg:
-            add_comment(self.parsed_url, self.refspec, "\n".join(msg))
-            return True
+            try:
+                add_comment(self.parsed_url, self.refspec, "\n".join(msg))
+                published_count += 1
+            except Exception as e:
+                get_logger().exception("Failed to publish Gerrit code suggestions: {}", e)
+
+        return published_count > 0 or publishable_count == 0
 
     def publish_comment(self, pr_comment: str, is_temporary: bool = False):
         if not is_temporary:
             msg = adopt_to_gerrit_message(pr_comment)
             add_comment(self.parsed_url, self.refspec, msg)
+
+    def supports_comment_publish_confirmation(self) -> bool:
+        return False
 
     def publish_description(self, pr_title: str, pr_body: str):
         msg = adopt_to_gerrit_message(pr_body)

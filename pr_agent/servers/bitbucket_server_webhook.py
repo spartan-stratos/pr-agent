@@ -2,11 +2,10 @@ import ast
 import copy
 import json
 import os
-import re
 from typing import List
 
 import uvicorn
-from fastapi import APIRouter, FastAPI
+from fastapi import APIRouter
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import RedirectResponse
 from starlette import status
@@ -21,7 +20,14 @@ from pr_agent.agent.pr_agent import PRAgent, prepare_command
 from pr_agent.config_loader import get_settings, global_settings
 from pr_agent.git_providers.utils import apply_repo_settings
 from pr_agent.log import LoggingFormat, get_logger, setup_logger
-from pr_agent.servers.utils import verify_signature
+from pr_agent.servers.request_body_limit import create_server_app
+from pr_agent.servers.utils import (
+    get_pr_commands,
+    is_command_comment,
+    push_trigger_slot,
+    shared_should_process_pr_logic,
+    verify_signature,
+)
 
 setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "DEBUG"))
 router = APIRouter()
@@ -44,84 +50,48 @@ def handle_request(
 
 def should_process_pr_logic(data) -> bool:
     try:
-        pr_data = data.get("pullRequest", {})
-        title = pr_data.get("title", "")
+        if not shared_should_process_pr_logic(data, provider="bitbucket_server", raise_on_error=True):
+            return False
+    except Exception:
+        # Preserve fail-open fallback without continuing into folder filtering on error
+        return True
 
-        from_ref = pr_data.get("fromRef", {})
-        source_branch = from_ref.get("displayId", "") if from_ref else ""
-
-        to_ref = pr_data.get("toRef", {})
-        target_branch = to_ref.get("displayId", "") if to_ref else ""
-
-        author = pr_data.get("author", {})
-        user = author.get("user", {}) if author else {}
-        sender = user.get("name", "") if user else ""
-
-        repository = to_ref.get("repository", {}) if to_ref else {}
-        project = repository.get("project", {}) if repository else {}
-        project_key = project.get("key", "") if project else ""
-        repo_slug = repository.get("slug", "") if repository else ""
-
-        repo_full_name = f"{project_key}/{repo_slug}" if project_key and repo_slug else ""
-        pr_id = pr_data.get("id", None)
-
-        # To ignore PRs from specific repositories
-        ignore_repos = get_settings().get("CONFIG.IGNORE_REPOSITORIES", [])
-        if repo_full_name and ignore_repos:
-            if any(re.search(regex, repo_full_name) for regex in ignore_repos):
-                get_logger().info(f"Ignoring PR from repository '{repo_full_name}' due to 'config.ignore_repositories' setting")
-                return False
-
-        # To ignore PRs from specific users
-        ignore_pr_users = get_settings().get("CONFIG.IGNORE_PR_AUTHORS", [])
-        if ignore_pr_users and sender:
-            if any(re.search(regex, sender) for regex in ignore_pr_users):
-                get_logger().info(f"Ignoring PR from user '{sender}' due to 'config.ignore_pr_authors' setting")
-                return False
-
-        # To ignore PRs with specific titles
-        if title:
-            ignore_pr_title_re = get_settings().get("CONFIG.IGNORE_PR_TITLE", [])
-            if not isinstance(ignore_pr_title_re, list):
-                ignore_pr_title_re = [ignore_pr_title_re]
-            if ignore_pr_title_re and any(re.search(regex, title) for regex in ignore_pr_title_re):
-                get_logger().info(f"Ignoring PR with title '{title}' due to config.ignore_pr_title setting")
-                return False
-
-        ignore_pr_source_branches = get_settings().get("CONFIG.IGNORE_PR_SOURCE_BRANCHES", [])
-        ignore_pr_target_branches = get_settings().get("CONFIG.IGNORE_PR_TARGET_BRANCHES", [])
-        if (ignore_pr_source_branches or ignore_pr_target_branches):
-            if any(re.search(regex, source_branch) for regex in ignore_pr_source_branches):
-                get_logger().info(
-                    f"Ignoring PR with source branch '{source_branch}' due to config.ignore_pr_source_branches settings")
-                return False
-            if any(re.search(regex, target_branch) for regex in ignore_pr_target_branches):
-                get_logger().info(
-                    f"Ignoring PR with target branch '{target_branch}' due to config.ignore_pr_target_branches settings")
-                return False
-
-        # Allow_only_specific_folders
+    try:
+        # Filter by allowed folders if configured
         allowed_folders = get_settings().config.get("allow_only_specific_folders", [])
-        if allowed_folders and pr_id and project_key and repo_slug:
-            from pr_agent.git_providers.bitbucket_server_provider import BitbucketServerProvider
-            bitbucket_server_url = get_settings().get("BITBUCKET_SERVER.URL", "")
-            pr_url = f"{bitbucket_server_url}/projects/{project_key}/repos/{repo_slug}/pull-requests/{pr_id}"
-            provider = BitbucketServerProvider(pr_url=pr_url)
-            changed_files = provider.get_files()
-            if changed_files:
-                # Check if ALL files are outside allowed folders
-                all_files_outside = True
-                for file_path in changed_files:
-                    if any(file_path.startswith(folder) for folder in allowed_folders):
-                        all_files_outside = False
-                        break
+        if allowed_folders:
+            pr_data = data.get("pullRequest", {})
+            pr_id = pr_data.get("id", None)
+            to_ref = pr_data.get("toRef", {}) if pr_data else {}
+            repository = to_ref.get("repository", {}) if to_ref else {}
+            project = repository.get("project", {}) if repository else {}
+            project_key = project.get("key", "") if project else ""
+            repo_slug = repository.get("slug", "") if repository else ""
 
-                if all_files_outside:
-                    get_logger().info(f"Ignoring PR because all files {changed_files} are outside allowed folders {allowed_folders}")
-                    return False
+            if pr_id and project_key and repo_slug:
+                from pr_agent.git_providers.bitbucket_server_provider import BitbucketServerProvider
+
+                bitbucket_server_url = get_settings().get("BITBUCKET_SERVER.URL", "")
+                pr_url = f"{bitbucket_server_url}/projects/{project_key}/repos/{repo_slug}/pull-requests/{pr_id}"
+                provider = BitbucketServerProvider(pr_url=pr_url)
+                changed_files = provider.get_files()
+                if changed_files:
+                    # Check if ALL files are outside allowed folders
+                    all_files_outside = True
+                    for file_path in changed_files:
+                        if any(file_path.startswith(folder) for folder in allowed_folders):
+                            all_files_outside = False
+                            break
+
+                    if all_files_outside:
+                        get_logger().info(
+                            f"Ignoring PR because all files {changed_files} are outside "
+                            f"allowed folders {allowed_folders}"
+                        )
+                        return False
     except Exception as e:
         get_logger().error(f"Failed 'should_process_pr_logic': {e}")
-        return True # On exception - we continue. Otherwise, we could just end up with filtering all PRs
+        return True
     return True
 
 @router.post("/")
@@ -159,6 +129,7 @@ async def handle_webhook(background_tasks: BackgroundTasks, request: Request):
     log_context["event"] = "pull_request"
 
     commands_to_run = []
+    is_push_event = False
 
     # push event; -1 for push unassigned to a PR: Check auto commands for creation/updating
     if (data["eventKey"] == "pr:opened"
@@ -173,22 +144,34 @@ async def handle_webhook(background_tasks: BackgroundTasks, request: Request):
         if get_settings().config.disable_auto_feedback:  # auto commands for PR, and auto feedback is disabled
             get_logger().info(f"Auto feedback is disabled, skipping auto commands for PR {pr_url}", **log_context)
             return JSONResponse(
-                status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "PR ignored due to auto feedback not enabled"})
+                status_code=status.HTTP_200_OK,
+                content=jsonable_encoder({"message": "PR ignored due to auto feedback not enabled"})
             )
         get_settings().set("config.is_auto_command", True)
         if data["eventKey"] == "pr:opened":
-            commands_to_run.extend(_get_commands_list_from_settings('BITBUCKET_SERVER.PR_COMMANDS'))
+            commands_to_run.extend(get_pr_commands("bitbucket_server"))
         else: # Has to be: data["eventKey"] == "pr:from_ref_updated" or "repo:refs_changed"
             if not get_settings().get("BITBUCKET_SERVER.HANDLE_PUSH_TRIGGER"):
                 get_logger().info(f"Push trigger is disabled, skipping push commands for PR {pr_url}", **log_context)
                 return JSONResponse(
-                    status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "PR ignored due to push trigger not enabled"})
+                    status_code=status.HTTP_200_OK,
+                    content=jsonable_encoder({"message": "PR ignored due to push trigger not enabled"})
                 )
 
             get_settings().set("config.is_new_pr", False)
             commands_to_run.extend(_get_commands_list_from_settings('BITBUCKET_SERVER.PUSH_COMMANDS'))
+            is_push_event = True
     elif data["eventKey"] == "pr:comment:added":
-        commands_to_run.append(data["comment"]["text"])
+        comment_text = data["comment"]["text"]
+        if not is_command_comment(comment_text):
+            # A plain comment whose first word happens to be a command name must not
+            # dispatch a tool: the dispatcher strips an optional leading slash.
+            get_logger().info("Ignoring comment not starting with /")
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content=jsonable_encoder({"message": "Comment ignored - not a command"}),
+            )
+        commands_to_run.append(comment_text)
     else:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -197,7 +180,12 @@ async def handle_webhook(background_tasks: BackgroundTasks, request: Request):
 
     async def inner():
         try:
-            await _run_commands_sequentially(commands_to_run, pr_url, log_context)
+            if is_push_event:
+                async with push_trigger_slot(pr_url, allow_backlog=True, ttl=300) as proceed:
+                    if proceed:
+                        await _run_commands_sequentially(commands_to_run, pr_url, log_context)
+            else:
+                await _run_commands_sequentially(commands_to_run, pr_url, log_context)
         except Exception as e:
             get_logger().error(f"Failed to handle webhook: {e}")
 
@@ -257,10 +245,29 @@ async def root():
     return {"status": "ok"}
 
 
+app = create_server_app(middleware=[Middleware(RawContextMiddleware)])
+app.include_router(router)
+
+
 def start():
-    app = FastAPI(middleware=[Middleware(RawContextMiddleware)])
-    app.include_router(router)
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "3000")))
+    """
+    Start the BitBucket Webhook server.
+
+    The server port can be configured via the PORT environment variable.
+    Defaults to 3000 if PORT is not set or invalid.
+    """
+
+    raw_port = os.environ.get("PORT")
+    try:
+        port = int(raw_port) if raw_port else 3000
+        if not (1 <= port <= 65535):
+            raise ValueError(f"Port {port} is out of valid range")
+        if raw_port:
+            get_logger().info(f"Using custom PORT from environment: {port}")
+    except ValueError as e:
+        get_logger().warning(f"Invalid PORT environment variable ({e}), using default port 3000")
+        port = 3000
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":

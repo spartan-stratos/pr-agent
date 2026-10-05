@@ -4,11 +4,10 @@ import hashlib
 import hmac
 import json
 import os
-import re
 from datetime import datetime
 
 import uvicorn
-from fastapi import APIRouter, FastAPI, Request, status
+from fastapi import APIRouter, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from starlette.background import BackgroundTasks
@@ -17,11 +16,21 @@ from starlette_context import context
 from starlette_context.middleware import RawContextMiddleware
 
 from pr_agent.agent.pr_agent import PRAgent, prepare_command
+from pr_agent.algo.run_details import command_failed, init_run_details
 from pr_agent.config_loader import get_settings, global_settings
 from pr_agent.git_providers import get_git_provider_with_context
 from pr_agent.git_providers.utils import apply_repo_settings
 from pr_agent.log import LoggingFormat, get_logger, setup_logger
 from pr_agent.secret_providers import get_secret_provider, validate_secret_provider_setting
+from pr_agent.servers.request_body_limit import create_server_app
+from pr_agent.servers.utils import (
+    get_pr_commands,
+    is_ask_command_comment,
+    is_command_comment,
+    push_trigger_slot,
+    shared_should_process_pr_logic,
+)
+from pr_agent.telemetry.prometheus import attach_metrics_endpoint, prometheus_metrics_enabled
 
 setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "DEBUG"))
 router = APIRouter()
@@ -49,14 +58,22 @@ def get_fork_safe_secret_provider():
     return _secret_provider_state["provider"]
 
 
-async def handle_request(api_url: str, body: str, log_context: dict, sender_id: str, notify=None):
+async def handle_request(api_url: str, body: str, log_context: dict, sender_id: str, notify=None) -> bool:
     log_context["action"] = body
     log_context["event"] = "pull_request" if body == "/review" else "comment"
     log_context["api_url"] = api_url
     log_context["app_name"] = get_settings().get("CONFIG.APP_NAME", "Unknown")
 
+    # Comment commands can pass arbitrary arguments, so sibling-repo context is authorized
+    # against the commenter (the command actor) instead of the MR author. Fail closed when no
+    # trustworthy account can be recorded (e.g. the "unknown" fallback for missing sender data).
+    if isinstance(sender_id, int) and sender_id:
+        provider = get_git_provider_with_context(pr_url=api_url)
+        if hasattr(provider, "set_command_actor"):
+            provider.set_command_actor(sender_id)
+
     with get_logger().contextualize(**log_context):
-        await PRAgent().handle_request(api_url, body, notify)
+        return await PRAgent().handle_request(api_url, body, notify)
 
 async def _perform_commands_gitlab(commands_conf: str, agent: PRAgent, api_url: str,
                                    log_context: dict, data: dict):
@@ -66,12 +83,17 @@ async def _perform_commands_gitlab(commands_conf: str, agent: PRAgent, api_url: 
     if is_draft(data) and not feedback_on_draft:
         get_logger().info(f"Skipping draft MR: {api_url}")
         return
-    if commands_conf == "pr_commands" and get_settings().config.disable_auto_feedback:  # auto commands for PR, and auto feedback is disabled
+    # auto commands for PR, and auto feedback is disabled
+    if commands_conf == "pr_commands" and get_settings().config.disable_auto_feedback:
         get_logger().info(f"Auto feedback is disabled, skipping auto commands for PR {api_url=}", **log_context)
         return
     if not should_process_pr_logic(data): # Here we already updated the configurations
         return
-    commands = get_settings().get(f"gitlab.{commands_conf}", {})
+    commands = (
+        get_pr_commands("gitlab")
+        if commands_conf == "pr_commands"
+        else get_settings().get(f"gitlab.{commands_conf}", {})
+    )
     get_settings().set("config.is_auto_command", True)
     for command in commands:
         try:
@@ -85,7 +107,7 @@ async def _perform_commands_gitlab(commands_conf: str, agent: PRAgent, api_url: 
 
 def is_bot_user(data) -> bool:
     try:
-        # logic to ignore bot users (unlike Github, no direct flag for bot users in gitlab)
+        # logic to ignore bot users (unlike GitHub, no direct flag for bot users in gitlab)
         sender_name = data.get("user", {}).get("name", "unknown").lower()
         # Indicators are sourced from config.bot_user_indicators in configuration.toml so the
         # default list has a single source of truth and can be reused by other providers in
@@ -228,82 +250,28 @@ async def is_bot_assigned_as_reviewer(data) -> bool:
     return False
 
 def should_process_pr_logic(data) -> bool:
-    try:
-        if not data.get('object_attributes', {}):
-            return False
-        title = data['object_attributes'].get('title') or ''
-        sender = data.get("user", {}).get("username", "")
-        repo_full_name = data.get('project', {}).get('path_with_namespace', "")
-
-        # logic to ignore PRs from specific repositories
-        ignore_repos = get_settings().get("CONFIG.IGNORE_REPOSITORIES", [])
-        if ignore_repos and repo_full_name:
-            if any(re.search(regex, repo_full_name) for regex in ignore_repos):
-                get_logger().info(f"Ignoring MR from repository '{repo_full_name}' due to 'config.ignore_repositories' setting")
-                return False
-
-        # logic to ignore PRs from specific users
-        ignore_pr_users = get_settings().get("CONFIG.IGNORE_PR_AUTHORS", [])
-        if ignore_pr_users and sender:
-            if any(re.search(regex, sender) for regex in ignore_pr_users):
-                get_logger().info(f"Ignoring PR from user '{sender}' due to 'config.ignore_pr_authors' settings")
-                return False
-
-        # logic to ignore MRs for titles, labels and source, target branches.
-        ignore_mr_title = get_settings().get("CONFIG.IGNORE_PR_TITLE", [])
-        ignore_mr_labels = get_settings().get("CONFIG.IGNORE_PR_LABELS", [])
-        ignore_mr_source_branches = get_settings().get("CONFIG.IGNORE_PR_SOURCE_BRANCHES", [])
-        ignore_mr_target_branches = get_settings().get("CONFIG.IGNORE_PR_TARGET_BRANCHES", [])
-
-        #
-        if ignore_mr_source_branches:
-            source_branch = data['object_attributes'].get('source_branch') or ''
-            if any(re.search(regex, source_branch) for regex in ignore_mr_source_branches):
-                get_logger().info(
-                    f"Ignoring MR with source branch '{source_branch}' due to gitlab.ignore_mr_source_branches settings")
-                return False
-
-        if ignore_mr_target_branches:
-            target_branch = data['object_attributes'].get('target_branch') or ''
-            if any(re.search(regex, target_branch) for regex in ignore_mr_target_branches):
-                get_logger().info(
-                    f"Ignoring MR with target branch '{target_branch}' due to gitlab.ignore_mr_target_branches settings")
-                return False
-
-        if ignore_mr_labels:
-            labels = [label['title'] for label in data['object_attributes'].get('labels') or []]
-            if any(label in ignore_mr_labels for label in labels):
-                labels_str = ", ".join(labels)
-                get_logger().info(f"Ignoring MR with labels '{labels_str}' due to gitlab.ignore_mr_labels settings")
-                return False
-
-        if ignore_mr_title:
-            if any(re.search(regex, title) for regex in ignore_mr_title):
-                get_logger().info(f"Ignoring MR with title '{title}' due to gitlab.ignore_mr_title settings")
-                return False
-    except Exception as e:
-        get_logger().error(f"Failed 'should_process_pr_logic': {e}")
-    return True
+    return shared_should_process_pr_logic(data, provider="gitlab")
 
 
 def authenticate_gitlab_webhook(request: Request, log_context: dict):
     request_token = request.headers.get("X-Gitlab-Token")
     # Built only for a request that will actually consult it, so a cloud client that
-    # fails to initialize cannot drop webhooks authenticated by shared secret instead.
-    secret_provider = get_fork_safe_secret_provider() if request_token else None
-    if request_token and secret_provider:
-        secret = secret_provider.get_secret(request_token)
-        if not secret:
-            get_logger().warning("Empty secret retrieved for the provided webhook token")
-            return JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED,
-                                content=jsonable_encoder({"message": "unauthorized"}))
+    # fails to initialize or read cannot drop webhooks authenticated by shared secret instead.
+    secret = None
+    if request_token:
+        try:
+            secret_provider = get_fork_safe_secret_provider()
+            secret = secret_provider.get_secret(request_token) if secret_provider else None
+        except Exception as e:
+            get_logger().warning(f"Secret provider failed ({type(e).__name__}), falling back to the shared secret")
+    if secret:
         try:
             secret_dict = json.loads(secret)
-            gitlab_token = secret_dict["gitlab_token"]
+            context["settings"].gitlab.personal_access_token = secret_dict["gitlab_token"]
             log_context["token_id"] = secret_dict.get("token_name", secret_dict.get("id", "unknown"))
-            context["settings"].gitlab.personal_access_token = gitlab_token
         except Exception as e:
-            get_logger().error(f"Failed to validate the secret for the provided webhook token: {e}")
+            get_logger().error(
+                f"Failed to validate the secret for the provided webhook token: {type(e).__name__}")
             return JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED,
                                 content=jsonable_encoder({"message": "unauthorized"}))
     elif get_settings().get("GITLAB.SHARED_SECRET"):
@@ -357,6 +325,26 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                 apply_repo_settings(url)
                 await _perform_commands_gitlab("pr_commands", PRAgent(), url, log_context, data)
 
+            # for draft to ready triggered merge requests, before the push case: one update can be both
+            elif object_attributes.get('action') == 'update' and is_draft_ready(data):
+                url = object_attributes.get('url')
+                get_logger().info(f"Draft MR is ready: {url}")
+
+                apply_repo_settings(url)
+                if get_settings().get("gitlab.feedback_on_draft_pr", False):
+                    # the draft was already getting feedback, so only the push half of this update is new
+                    if (object_attributes.get('oldrev')
+                            and get_settings().get("gitlab.push_commands", {})
+                            and get_settings().get("gitlab.handle_push_trigger", False)):
+                        get_logger().debug(f'A push event has been received: {url}')
+                        async with push_trigger_slot(url, allow_backlog=True, ttl=300) as proceed:
+                            if proceed:
+                                await _perform_commands_gitlab("push_commands", PRAgent(), url, log_context, data)
+                    else:
+                        get_logger().info(f"Skipping draft-ready commands because draft feedback is enabled: {url}")
+                    return
+                await _perform_commands_gitlab("pr_commands", PRAgent(), url, log_context, data)
+
             # for push event triggered merge requests
             elif object_attributes.get('action') == 'update' and object_attributes.get('oldrev'):
                 url = object_attributes.get('url')
@@ -371,18 +359,9 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                     return
 
                 get_logger().debug(f'A push event has been received: {url}')
-                await _perform_commands_gitlab("push_commands", PRAgent(), url, log_context, data)
-
-            # for draft to ready triggered merge requests
-            elif object_attributes.get('action') == 'update' and is_draft_ready(data):
-                url = object_attributes.get('url')
-                get_logger().info(f"Draft MR is ready: {url}")
-
-                apply_repo_settings(url)
-                if get_settings().get("gitlab.feedback_on_draft_pr", False):
-                    get_logger().info(f"Skipping draft-ready commands because draft feedback is enabled: {url}")
-                    return
-                await _perform_commands_gitlab("pr_commands", PRAgent(), url, log_context, data)
+                async with push_trigger_slot(url, allow_backlog=True, ttl=300) as proceed:
+                    if proceed:
+                        await _perform_commands_gitlab("push_commands", PRAgent(), url, log_context, data)
 
             # for reviewer assignment triggered merge requests
             elif object_attributes.get('action') == 'update' and not object_attributes.get('oldrev'):
@@ -407,7 +386,8 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
 
                 # Check PR logic after applying repo settings
                 if not should_process_pr_logic(data):
-                    return JSONResponse(status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "success"}))
+                    return JSONResponse(
+                        status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "success"}))
 
                 if is_draft(data):
                     get_logger().info(f"Skipping draft MR reviewer assignment: {url}")
@@ -415,7 +395,8 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
                                         content=jsonable_encoder({"message": "success"}))
                 if await is_bot_assigned_as_reviewer(data):
                     reviewer_commands = get_settings().get("gitlab.reviewer_commands", [])
-                    if not isinstance(reviewer_commands, list) or not all(isinstance(c, str) for c in reviewer_commands):
+                    if (not isinstance(reviewer_commands, list)
+                            or not all(isinstance(c, str) for c in reviewer_commands)):
                         get_logger().warning("gitlab.reviewer_commands is not a list of strings, skipping")
                         return JSONResponse(status_code=status.HTTP_200_OK,
                                             content=jsonable_encoder({"message": "success"}))
@@ -431,10 +412,45 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
 
                 get_logger().info(f"A comment has been added to a merge request: {url}")
                 body = data.get('object_attributes', {}).get('note')
-                if data.get('object_attributes', {}).get('type') == 'DiffNote' and '/ask' in body: # /ask_line
+                if not is_command_comment(body):
+                    # A plain comment whose first word happens to be a command name must not
+                    # dispatch a tool: the dispatcher strips an optional leading slash.
+                    get_logger().info("Ignoring comment not starting with /")
+                    return
+                discussion_id = data.get('object_attributes', {}).get('discussion_id')
+                command = body.split(maxsplit=1)[0].lower() if isinstance(body, str) and body.strip() else ""
+                if (discussion_id and not data.get('object_attributes', {}).get('type')
+                        and command in ("/review", "/review_pr", "/improve", "/improve_code")):
+                    body = f"{body} --comment_id={discussion_id}"
+                if (data.get('object_attributes', {}).get('type') == 'DiffNote'
+                        and is_ask_command_comment(body)):  # /ask_line
                     body = handle_ask_line(body, data)
 
-                await handle_request(url, body, log_context, sender_id, notify=lambda: provider.add_eyes_reaction(comment_id))
+                # A fresh collector, so the verdict below can only come from this command.
+                init_run_details()
+                dispatched = False
+
+                def notify_start_reaction():
+                    # Use `notify` as the gate on "was this a command": `PRAgent` calls it only
+                    # once it decides to run something. Re-parsing the comment here would be a
+                    # second opinion, and the dispatcher reads it with shlex and rewrites `/ask` on
+                    # a diff line into `/ask_line`.
+                    nonlocal dispatched
+                    dispatched = True
+                    # Keep start acknowledgement synchronous because notify is not awaitable.
+                    provider.add_eyes_reaction(comment_id)
+
+                result = await handle_request(
+                    url, body, log_context, sender_id, notify=notify_start_reaction)
+                if not dispatched:
+                    return
+                # `propagate_tool_errors` is off, so a tool that failed internally still returns
+                # normally. Reading that as success would tick a comment whose command never ran.
+                # `bool()` rather than `result is not False`, so a `None` reads as failure here the
+                # same way it does in `pr_reviewer` and the GitHub App
+                # Offload outcome HTTP requests while preserving request-scoped settings.
+                await asyncio.to_thread(
+                    provider.react_to_outcome, comment_id, bool(result) and not command_failed())
 
     background_tasks.add_task(inner, request_json)
     end_time = datetime.now()
@@ -445,18 +461,28 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
 def handle_ask_line(body, data):
     try:
         line_range_ = data['object_attributes']['position']['line_range']
-        # if line_range_['start']['type'] == 'new':
-        start_line = line_range_['start']['new_line']
-        end_line = line_range_['end']['new_line']
-        # else:
-        #     start_line = line_range_['start']['old_line']
-        #     end_line = line_range_['end']['old_line']
-        question = body.replace('/ask', '').strip()
+        if line_range_['start'].get('type', 'new') == 'old':
+            start_line = line_range_['start']['old_line']
+            end_line = line_range_['end']['old_line']
+            side = 'LEFT'
+        else:
+            start_line = line_range_['start']['new_line']
+            end_line = line_range_['end']['new_line']
+            side = 'RIGHT'
+        question = body.strip().removeprefix('/ask').strip()
         path = data['object_attributes']['position']['new_path']
-        side = 'RIGHT'  # if line_range_['start']['type'] == 'new' else 'LEFT'
         comment_id = data['object_attributes']["discussion_id"]
         get_logger().info("Handling line ")
-        body = f"/ask_line --line_start={start_line} --line_end={end_line} --side={side} --file_name={path} --comment_id={comment_id} {question}"
+        body = [
+            "/ask_line",
+            f"--line_start={start_line}",
+            f"--line_end={end_line}",
+            f"--side={side}",
+            f"--file_name={path}",
+            f"--comment_id={comment_id}",
+        ]
+        if question:
+            body.append(question)
     except Exception as e:
         get_logger().error(f"Failed to handle ask line comment: {e}")
     return body
@@ -471,7 +497,9 @@ if not gitlab_url:
     raise ValueError("GITLAB.URL is not set")
 get_settings().config.git_provider = "gitlab"
 middleware = [Middleware(RawContextMiddleware)]
-app = FastAPI(middleware=middleware)
+if prometheus_metrics_enabled():
+    attach_metrics_endpoint(router)
+app = create_server_app(middleware=middleware)
 app.include_router(router)
 
 

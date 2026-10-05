@@ -1,3 +1,8 @@
+---
+title: "Usage and Automation"
+sidebar_position: 5
+---
+
 ## Local repo (CLI)
 
 When running from your locally cloned PR-Agent repo (CLI), your local configuration file will be used.
@@ -33,6 +38,14 @@ This is useful for debugging or experimenting with different tools.
 
 3. **git provider**: The [git_provider](https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/settings/configuration.toml) field in a configuration file determines the GIT provider that will be used by PR-Agent. Currently, the following providers are supported:
 `github` **(default)**, `gitlab`, `bitbucket`, `azure`, `codecommit`, `local`, and `gitea`.
+
+4. For scripts that need a failed request to return a non-zero process status, enable tool error propagation:
+
+```bash
+python -m pr_agent.cli --pr_url=<pr_url> review --config.propagate_tool_errors=true
+```
+
+When a propagated tool error makes the request fail, the installed `pr-agent` command, `python -m pr_agent.cli`, and the customizable pip script exit with status 1. The default remains compatible with existing CLI behavior and exits with status 0; argparse parse and usage errors continue to exit with status 2.
 
 ### CLI Health Check
 
@@ -92,9 +105,9 @@ When this parameter is set to `true`, PR-Agent will not run any automatic tools 
 
 ### GitHub App
 
-!!! note "Configurations for PR-Agent"
-    PR-Agent for GitHub is an App, hosted by Codium. So all the instructions below are relevant for PR-Agent users.
-    Same goes for [GitLab webhook](#gitlab-webhook) and [BitBucket App](#bitbucket-app) sections.
+:::note[Configurations for PR-Agent]
+These settings apply to self-hosted GitHub App, GitLab webhook, and Bitbucket App deployments.
+:::
 
 #### GitHub app automatic tools when a new PR is opened
 
@@ -140,6 +153,7 @@ Every time you run the `describe` tool (including automatic runs) the PR title w
 **Parameters for automated runs:**
 
 You can customize configurations specifically for automated runs by using the `--config_path=<value>` parameter.
+These command parameters apply before repository loading, so they can control that loading, and again afterward so command values take precedence over repository settings.
 For instance, to modify the `review` tool settings only for newly opened PRs, use:
 
 ```toml
@@ -176,8 +190,10 @@ This means that when new code is pushed to the PR, PR-Agent will run the `descri
 `GitHub Action` is a different way to trigger PR-Agent tools, and uses a different configuration mechanism than `GitHub App`.<br>
 You can configure settings for `GitHub Action` by adding environment variables under the env section in `.github/workflows/pr_agent.yml` file.
 
-!!! tip "Fork/contribution support"
-    To support PRs from forked repositories, use the `pull_request_target` event instead of `pull_request`. See the [fork contribution guide](../installation/github.md#using-with-pull_request_target-forkcontribution-support) for a complete example and security considerations.
+:::tip[Fork/contribution support]
+To support PRs from forked repositories, use the `pull_request_target` event instead of `pull_request`. See the [fork contribution guide](../installation/github.md#using-with-pull_request_target-forkcontribution-support) for a complete example and security considerations.
+:::
+
 Specifically, start by setting the following environment variables:
 
 ```yaml
@@ -205,11 +221,41 @@ Adding `"synchronize"` to this list enables auto tools on new commits pushed to 
 
 `github_action_config.push_trigger_ignore_bot_commits` (default `true`) skips processing when the push author is a bot, avoiding redundant runs on automated commits.
 
+`github_action_config.fail_on_tool_errors` (default `true`) makes the Action exit non-zero when a tool recorded a swallowed failure (the default `propagate_tool_errors = false` case), instead of finishing green on a pull request that got no review. Set it to `false` to restore the previous behavior of ignoring recorded tool failures. Set it in the workflow configuration; comment arguments such as `/review --github_action_config.fail_on_tool_errors=false` are rejected.
+
+#### Automatic tools after a submitted GitHub review
+
+The GitHub App can run configured tools after a human reviewer submits a native GitHub review. This is opt-in: `review_commands` is empty by default. By default, only reviews submitted with the `changes_requested` state by a `User` review author trigger the commands. This conservative default avoids running on the repository's high-volume `commented` reviews; set `review_states` or `review_author_types` explicitly when a different workflow is needed.
+
+```toml
+[github_app]
+review_states = ["changes_requested"]
+review_author_types = ["User"]
+review_commands = [
+    "/improve",
+]
+```
+
+The event must be `submitted`; edited or dismissed reviews do not trigger tools. The review author's `user.type` must match `review_author_types`, which defaults to `User` and prevents bot reviews from triggering commands. Existing repository filtering, draft-PR handling, eligibility checks, and `config.disable_auto_feedback` still apply. The review text is not treated as a command; each configured command runs with the normal pull-request context.
+
+For GitHub Action, add the review event to the workflow and configure the equivalent settings. `github_action_config.*` overrides the corresponding `github_app.*` setting when present.
+
+```yaml
+on:
+  pull_request_review:
+    types: [submitted]
+
+env:
+  github_action_config.review_states: '["changes_requested"]'
+  github_action_config.review_author_types: '["User"]'
+  github_action_config.review_commands: '["/improve"]'
+```
+
 `github_action_config.enable_output` are used to enable/disable github actions [output parameter](https://docs.github.com/en/actions/creating-actions/metadata-syntax-for-github-actions#outputs-for-docker-container-and-javascript-actions) (default is `true`).
 Review result is output as JSON to `steps.{step-id}.outputs.review` property.
 The JSON structure is equivalent to the yaml data structure defined in [pr_reviewer_prompts.toml](https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/settings/pr_reviewer_prompts.toml).
 
-`github.publish_as_check_run` controls whether tool output (review, describe, improve) is published as a GitHub Check Run instead of a PR comment (default is `false`). When enabled, results appear in the "Checks" tab of the PR. Requires `checks: write` permission in the workflow YAML.
+`github.publish_as_check_run` controls whether tool output (review, describe, improve) is published as a GitHub Check Run instead of a PR comment (default is `false`). When enabled, results appear in the "Checks" tab of the PR. Requires `checks: write` permission in the workflow YAML. On the GitHub App, each automatic command opens its check run as in progress before the tool runs, so the author sees that PR-Agent picked the pull request up before any output exists; the run is completed with the tool's output, or marked failed if the command did not finish.
 
 Note that you can give additional config parameters by adding environment variables to `.github/workflows/pr_agent.yml`, or by using a `.pr_agent.toml` [configuration file](./configuration_options.md#global-configuration-file) in the root of your repo
 
@@ -243,8 +289,8 @@ For detailed step-by-step examples of configuring different models (Gemini, Clau
 **Common Model Configuration Patterns:**
 
 - **OpenAI**: Set `config.model: "<openai-model>"` and `OPENAI_KEY`
-- **Gemini**: Set `config.model: "gemini/gemini-1.5-flash"` and `GOOGLE_AI_STUDIO.GEMINI_API_KEY` (no `OPENAI_KEY` needed)
-- **Claude**: Set `config.model: "anthropic/claude-3-opus-20240229"` and `ANTHROPIC.KEY` (no `OPENAI_KEY` needed)
+- **Gemini**: Set `config.model: "gemini/gemini-3.8-flash"` and `GOOGLE_AI_STUDIO.GEMINI_API_KEY` (no `OPENAI_KEY` needed)
+- **Claude**: Set `config.model: "anthropic/claude-opus-5"` and `ANTHROPIC.KEY` (no `OPENAI_KEY` needed)
 - **Azure OpenAI**: Set `OPENAI.API_TYPE: "azure"`, `OPENAI.API_BASE`, and `OPENAI.DEPLOYMENT_ID`
 - **Local Models**: Set `config.model: "ollama/model-name"` and `OLLAMA.API_BASE`
 
@@ -308,7 +354,9 @@ Draft MRs and MRs matching the [ignore settings](additional_configurations.md#ig
 
 Similar to GitHub app, when running PR-Agent from BitBucket App, the default [configuration file](https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/settings/configuration.toml) will be initially loaded.
 
-By uploading a local `.pr_agent.toml` file to the root of the repo's default branch, you can edit and customize any configuration parameter. Note that you need to upload `.pr_agent.toml` prior to creating a PR, in order for the configuration to take effect.
+By uploading a local `.pr_agent.toml` file to the root of the repo's default branch, you can customize parameters that support repository-level overrides. Note that you need to upload `.pr_agent.toml` prior to creating a PR, in order for the configuration to take effect.
+
+Provider endpoint settings are host-controlled. Values for the endpoint keys listed in the [local configuration guide](./configuration_options.md#local-configuration-file) are ignored when set in repository-local `.pr_agent.toml` and must be configured on the host.
 
 For example, if your local `.pr_agent.toml` file contains:
 
@@ -337,7 +385,7 @@ Specifically, set the following values:
 [bitbucket_app]
 pr_commands = [
     "/review",
-    "/improve --pr_code_suggestions.commitable_code_suggestions=true --pr_code_suggestions.suggestions_score_threshold=7",
+    "/improve --pr_code_suggestions.committable_code_suggestions=true --pr_code_suggestions.suggestions_score_threshold=7",
 ]
 ```
 

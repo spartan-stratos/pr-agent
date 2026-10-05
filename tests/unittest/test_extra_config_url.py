@@ -119,14 +119,18 @@ def test_resolve_returns_bare_local_path_without_tempfile(toml_on_disk):
 
 
 def test_resolve_accepts_file_url_scheme(toml_on_disk):
-    path, is_temp = _resolve_extra_config_to_file(f"file://{toml_on_disk}")
+    from pathlib import Path
+    path, is_temp = _resolve_extra_config_to_file(Path(toml_on_disk).as_uri())
     assert path == toml_on_disk
     assert is_temp is False
 
 
 def test_resolve_accepts_file_url_with_localhost_netloc(toml_on_disk):
     # file://localhost/<abs-path> is RFC 8089 form and must resolve same as file://
-    path, is_temp = _resolve_extra_config_to_file(f"file://localhost{toml_on_disk}")
+    from pathlib import Path
+    from urllib.parse import urlparse
+    uri_path = urlparse(Path(toml_on_disk).as_uri()).path  # /abs/path or /C:/abs/path
+    path, is_temp = _resolve_extra_config_to_file(f"file://localhost{uri_path}")
     assert path == toml_on_disk
     assert is_temp is False
 
@@ -135,7 +139,8 @@ def test_resolve_file_url_decodes_percent_encoded_path(tmp_path):
     # A real file at a path containing a space — file:// URL must percent-encode it.
     p = tmp_path / "name with space.toml"
     p.write_bytes(SAMPLE_TOML)
-    url = f"file://{str(p).replace(' ', '%20')}"
+    from pathlib import Path
+    url = Path(p).as_uri()  # Path.as_uri() percent-encodes spaces and is valid on all platforms
     path, is_temp = _resolve_extra_config_to_file(url)
     assert path == str(p), "file:// percent-encoded path must be URL-decoded before stat()"
     assert is_temp is False
@@ -320,23 +325,26 @@ def test_cli_parser_flag_takes_precedence_over_env_var(monkeypatch):
 
 
 def test_cli_setting_reconciles_between_runs(settings_sandbox, monkeypatch):
-    """Regression: in long-lived processes that call run() multiple times,
-    a previously-set CONFIG.EXTRA_CONFIG_URL must not leak into the next call
-    that omits the flag/env var. get_settings() is a process-wide singleton."""
+    """Keep each CLI invocation's extra config URL scoped to its own dispatch."""
     from argparse import Namespace
 
     import pr_agent.cli as cli_mod
 
     # Stub PRAgent so run() returns quickly without making network calls;
     # we only care about the synchronous setting-reconciliation prologue.
+    observed_urls = []
+
     class _StubAgent:
         async def handle_request(self, *_args, **_kwargs):
+            observed_urls.append(get_settings().get("CONFIG.EXTRA_CONFIG_URL"))
             return True
 
     monkeypatch.setattr(cli_mod, "PRAgent", lambda: _StubAgent())
     monkeypatch.delenv("PR_AGENT_EXTRA_CONFIG_URL", raising=False)
 
-    # First invocation: explicit URL — should populate the singleton key
+    outer_url_before = get_settings().get("CONFIG.EXTRA_CONFIG_URL")
+
+    # Use the explicit URL only within this invocation's settings scope.
     cli_mod.run(args=Namespace(
         pr_url="https://example.com/pr/1",
         issue_url=None,
@@ -344,9 +352,8 @@ def test_cli_setting_reconciles_between_runs(settings_sandbox, monkeypatch):
         command="review",
         rest=[],
     ))
-    assert get_settings().get("CONFIG.EXTRA_CONFIG_URL") == "/first/run.toml"
 
-    # Second invocation: no URL — singleton key must be CLEARED, not carried over
+    # Omit the URL in the next invocation and verify that it is not inherited.
     cli_mod.run(args=Namespace(
         pr_url="https://example.com/pr/1",
         issue_url=None,
@@ -354,10 +361,8 @@ def test_cli_setting_reconciles_between_runs(settings_sandbox, monkeypatch):
         command="review",
         rest=[],
     ))
-    assert get_settings().get("CONFIG.EXTRA_CONFIG_URL") in (None, ""), (
-        "CONFIG.EXTRA_CONFIG_URL must be cleared when the flag/env var is "
-        f"absent; got {get_settings().get('CONFIG.EXTRA_CONFIG_URL')!r}"
-    )
+    assert observed_urls == ["/first/run.toml", None]
+    assert get_settings().get("CONFIG.EXTRA_CONFIG_URL") == outer_url_before
 
 
 # ---------------------------------------------------------------------------

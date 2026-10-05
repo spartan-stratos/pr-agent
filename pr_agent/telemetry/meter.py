@@ -73,6 +73,12 @@ def _create_metric_exporter(config):
         if config.otlp_headers:
             kwargs["headers"] = config.otlp_headers
         return OTLPMetricExporter(**kwargs)
+    elif config.exporter_type == ExporterType.PROMETHEUS:
+        # Imported lazily so the gunicorn master (preload_app) never pulls in
+        # prometheus_client before the multiprocess dir is provisioned.
+        from pr_agent.telemetry.prometheus import PrometheusMetricExporter
+
+        return PrometheusMetricExporter()
     return None
 
 
@@ -80,4 +86,22 @@ def _create_metric_exporter(config):
 def get_commands_counter():
     return get_meter().create_counter(
         "pr_agent.commands", unit="{command}", description="PR-Agent commands executed"
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def get_tokens_counter():
+    return get_meter().create_counter(
+        "pr_agent.tokens",
+        unit="{token}",
+        description="Tokens consumed by PR-Agent commands, by token type",
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def get_ai_calls_counter():
+    return get_meter().create_counter(
+        "pr_agent.ai_calls",
+        unit="{call}",
+        description="Successful AI calls made by PR-Agent commands",
     )

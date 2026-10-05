@@ -1,10 +1,9 @@
 import copy
-import secrets
 from enum import Enum
 from json import JSONDecodeError
 
 import uvicorn
-from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from starlette.middleware import Middleware
@@ -15,32 +14,32 @@ from pr_agent.agent.pr_agent import PRAgent
 from pr_agent.config_loader import get_settings, global_settings
 from pr_agent.git_providers.gerrit_provider import GerritProvider
 from pr_agent.log import get_logger, setup_logger
+from pr_agent.servers.request_body_limit import create_server_app
+from pr_agent.servers.utils import basic_auth_matches
 
 setup_logger()
 router = APIRouter()
 security = HTTPBasic(auto_error=False)
 
 
-def authorize(credentials: HTTPBasicCredentials = Depends(security)):
-    """Reject unauthenticated calls when webhook credentials are configured."""
+def authorize(credentials: HTTPBasicCredentials = Depends(security)):  # noqa: B008
+    """Require the configured webhook credentials on every call."""
     gerrit_settings = get_settings().get("gerrit", {})
     username = gerrit_settings.get("webhook_username", None) if gerrit_settings else None
     password = gerrit_settings.get("webhook_password", None) if gerrit_settings else None
-    if not username and not password:
-        return
     if not username or not password:
-        get_logger().error("Incomplete gerrit webhook credentials: set both "
-                           "gerrit.webhook_username and gerrit.webhook_password, or neither")
-        raise HTTPException(status_code=500, detail="Webhook authentication is misconfigured.")
+        # The route runs commands with caller-supplied arguments, so an unconfigured
+        # deployment is refused rather than left open, as the GitHub app does.
+        get_logger().error("Rejecting gerrit webhook: set both "
+                           "gerrit.webhook_username and gerrit.webhook_password")
+        raise HTTPException(status_code=403, detail="Webhook authentication is not configured.")
     if credentials is None:
         raise HTTPException(
             status_code=401,
             detail="Missing credentials.",
             headers={"WWW-Authenticate": "Basic"},
         )
-    is_user_ok = secrets.compare_digest(credentials.username, username)
-    is_pass_ok = secrets.compare_digest(credentials.password, password)
-    if not (is_user_ok and is_pass_ok):
+    if not basic_auth_matches(credentials, username, password):
         raise HTTPException(
             status_code=401,
             detail="Incorrect username or password.",
@@ -53,7 +52,6 @@ class Action(str, Enum):
     describe = "describe"
     ask = "ask"
     improve = "improve"
-    reflect = "reflect"
     answer = "answer"
 
 
@@ -129,7 +127,7 @@ def start():
     # to prevent adding help messages with the output
     get_settings().set("CONFIG.CLI_MODE", True)
     middleware = [Middleware(RawContextMiddleware)]
-    app = FastAPI(middleware=middleware)
+    app = create_server_app(middleware=middleware)
     app.include_router(router)
 
     uvicorn.run(app, host="0.0.0.0", port=3000)

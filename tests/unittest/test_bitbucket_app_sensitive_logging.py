@@ -92,3 +92,158 @@ async def test_installed_webhook_does_not_log_credentials(monkeypatch):
     assert shared_secret not in logged
     assert "handle_installed_webhooks" in logged
     assert json.loads(stored[0][1])["shared_secret"] == shared_secret
+
+
+class _FailingJsonRequest(_Request):
+    async def json(self):
+        self.json_calls += 1
+        raise ValueError("json-error-detail-sentinel")
+
+
+async def test_installed_webhook_does_not_log_json_error_details(monkeypatch):
+    logger = _RecordingLogger()
+    monkeypatch.setattr(bitbucket_app, "get_logger", lambda: logger)
+
+    result = await _route_endpoint("/installed", "POST")(
+        _FailingJsonRequest({}, None),
+        None,
+    )
+
+    logged = repr(logger.calls)
+    assert result.status_code == 500
+    assert "json-error-detail-sentinel" not in logged
+    assert "Failed to register user: invalid JSON payload (ValueError)" in logged
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_field"),
+    [
+        (
+            {"clientKey": "client-key-sentinel", "principal": {"username": "username-sentinel"}},
+            "sharedSecret",
+        ),
+        (
+            {"sharedSecret": "shared-secret-sentinel", "principal": {"username": "username-sentinel"}},
+            "clientKey",
+        ),
+        (
+            {"sharedSecret": "shared-secret-sentinel", "clientKey": "client-key-sentinel"},
+            "principal",
+        ),
+        (
+            {
+                "sharedSecret": "shared-secret-sentinel",
+                "clientKey": "client-key-sentinel",
+                "principal": {},
+            },
+            "principal.username",
+        ),
+    ],
+)
+async def test_installed_webhook_logs_missing_field_without_values(monkeypatch, payload, expected_field):
+    logger = _RecordingLogger()
+    monkeypatch.setattr(bitbucket_app, "get_logger", lambda: logger)
+
+    result = await _route_endpoint("/installed", "POST")(
+        _Request({}, payload),
+        None,
+    )
+
+    logged = repr(logger.calls)
+    assert result.status_code == 500
+    assert expected_field in logged
+    assert "shared-secret-sentinel" not in logged
+    assert "client-key-sentinel" not in logged
+    assert "username-sentinel" not in logged
+
+
+async def test_installed_webhook_rejects_non_object_payload_without_logging_values(monkeypatch):
+    logger = _RecordingLogger()
+    monkeypatch.setattr(bitbucket_app, "get_logger", lambda: logger)
+
+    result = await _route_endpoint("/installed", "POST")(
+        _Request({}, ["payload-value-sentinel"]),
+        None,
+    )
+
+    logged = repr(logger.calls)
+    assert result.status_code == 500
+    assert "payload-value-sentinel" not in logged
+    assert "installation payload must be a JSON object" in logged
+
+
+async def test_installed_webhook_does_not_log_store_secret_error(monkeypatch):
+    provider_error = "secret-provider-error-sentinel"
+    logger = _RecordingLogger()
+
+    class FailingSecretProvider:
+        def store_secret(self, secret_name, secret_value):
+            raise RuntimeError(provider_error)
+
+    monkeypatch.setattr(bitbucket_app, "get_logger", lambda: logger)
+    monkeypatch.setattr(bitbucket_app, "get_fork_safe_secret_provider", FailingSecretProvider)
+
+    result = await _route_endpoint("/installed", "POST")(
+        _Request(
+            {},
+            {
+                "sharedSecret": "shared-secret",
+                "clientKey": "client-key",
+                "principal": {"username": "user"},
+            },
+        ),
+        None,
+    )
+
+    logged = repr(logger.calls)
+    assert result.status_code == 500
+    assert provider_error not in logged
+    assert "Failed to register user: secret provider failure (RuntimeError)" in logged
+
+
+async def test_webhook_logs_only_selected_payload_fields(monkeypatch):
+    logger = _RecordingLogger()
+    background_tasks = BackgroundTasks()
+    payload = {
+        "event": "pullrequest:created",
+        "clientKey": "webhook-client-key",
+        "data": {
+            "sharedSecret": "webhook-secret-sentinel",
+            "description": "private-webhook-description",
+        },
+    }
+    monkeypatch.setattr(bitbucket_app, "get_logger", lambda: logger)
+
+    result = await _route_endpoint("/webhook", "POST")(
+        background_tasks,
+        _Request({"authorization": "JWT token"}, payload),
+    )
+
+    logged = repr(logger.calls)
+    assert result == "OK"
+    assert "pullrequest:created" in logged
+    assert "webhook-client-key" in logged
+    assert "event" in logged and "data" in logged
+    assert "webhook-secret-sentinel" not in logged
+    assert "private-webhook-description" not in logged
+
+
+async def test_uninstalled_webhook_logs_only_selected_payload_fields(monkeypatch):
+    logger = _RecordingLogger()
+    payload = {
+        "clientKey": "uninstalled-client-key",
+        "principal": {"username": "private-username"},
+        "sharedSecret": "uninstalled-secret-sentinel",
+    }
+    monkeypatch.setattr(bitbucket_app, "get_logger", lambda: logger)
+
+    await _route_endpoint("/uninstalled", "POST")(
+        _Request({}, payload),
+        None,
+    )
+
+    logged = repr(logger.calls)
+    assert "uninstalled-client-key" in logged
+    assert "clientKey" in logged and "principal" in logged and "sharedSecret" in logged
+    assert "private-username" not in logged
+    assert "uninstalled-secret-sentinel" not in logged

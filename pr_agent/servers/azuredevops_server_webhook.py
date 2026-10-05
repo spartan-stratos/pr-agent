@@ -6,17 +6,15 @@ import copy
 import json
 import os
 import re
-import secrets
 from urllib.parse import quote, unquote
 
 import uvicorn
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from starlette import status
 from starlette.background import BackgroundTasks
 from starlette.middleware import Middleware
-from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette_context import context
 from starlette_context.middleware import RawContextMiddleware
@@ -28,6 +26,9 @@ from pr_agent.git_providers import get_git_provider_with_context
 from pr_agent.git_providers.azuredevops_provider import AZURE_AGENT_RESPONSE_MARKER, AzureDevopsProvider
 from pr_agent.git_providers.utils import apply_repo_settings
 from pr_agent.log import LoggingFormat, get_logger, setup_logger
+from pr_agent.servers.request_body_limit import create_server_app
+from pr_agent.servers.utils import basic_auth_matches, get_pr_commands
+from pr_agent.telemetry.prometheus import attach_metrics_endpoint, prometheus_metrics_enabled
 
 setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "DEBUG"))
 security = HTTPBasic(auto_error=False)
@@ -66,12 +67,16 @@ async def handle_request_comment(url: str, body: str, thread_id: int, comment_id
                 return
             is_question = body.startswith("/ask")
             handled = await agent.handle_request(
-                url, body, notify=lambda: provider.reply_to_thread(thread_id, "On it! ⏳", True)
-            )
+                url, body, notify=lambda: provider.reply_to_thread(thread_id, "On it! ⏳", True),
+                # A tool that fails internally returns normally while `propagate_tool_errors` is
+                # false, and then a resolved discussion thread plus a deleted progress comment would
+                # read as "review done" for a review that was never published.
+                propagate_tool_errors=True)
             if handled and not is_question:
                 provider.set_thread_status(thread_id, "closed")
-            if handled:
-                provider.remove_initial_comment()
+            # The progress reply was posted before the command ran, so a failed run still has to
+            # take it back; only closing the thread depends on the outcome.
+            provider.remove_initial_comment()
     except Exception as e:
         get_logger().exception("Failed to handle webhook", artifact={"url": url, "body": body}, error=str(e))
 
@@ -180,9 +185,14 @@ def handle_line_comment(body: str, thread_id: int, comment_id: int, provider: Az
 
 # currently only basic auth is supported with azure webhooks
 # for this reason, https must be enabled to ensure the credentials are not sent in clear text
-def authorize(credentials: HTTPBasicCredentials = Depends(security)):
-    if WEBHOOK_USERNAME is None or WEBHOOK_PASSWORD is None:
+def authorize(credentials: HTTPBasicCredentials = Depends(security)):  # noqa: B008
+    if not WEBHOOK_USERNAME and not WEBHOOK_PASSWORD:
         return
+    if not WEBHOOK_USERNAME or not WEBHOOK_PASSWORD:
+        # Fail closed on a half-configured pair rather than reverting to open access.
+        get_logger().error("Incomplete azure_devops_server webhook credentials: set both "
+                           "webhook_username and webhook_password, or neither")
+        raise HTTPException(status_code=500, detail="Webhook authentication is misconfigured.")
 
     if credentials is None:
         raise HTTPException(
@@ -191,9 +201,7 @@ def authorize(credentials: HTTPBasicCredentials = Depends(security)):
             headers={"WWW-Authenticate": "Basic"},
         )
 
-    is_user_ok = secrets.compare_digest(credentials.username, WEBHOOK_USERNAME)
-    is_pass_ok = secrets.compare_digest(credentials.password, WEBHOOK_PASSWORD)
-    if not (is_user_ok and is_pass_ok):
+    if not basic_auth_matches(credentials, WEBHOOK_USERNAME, WEBHOOK_PASSWORD):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail='Incorrect username or password.',
@@ -203,10 +211,15 @@ def authorize(credentials: HTTPBasicCredentials = Depends(security)):
 
 async def _perform_commands_azure(commands_conf: str, agent: PRAgent, api_url: str, log_context: dict):
     apply_repo_settings(api_url)
-    if commands_conf == "pr_commands" and get_settings().config.disable_auto_feedback:  # auto commands for PR, and auto feedback is disabled
+    # auto commands for PR, and auto feedback is disabled
+    if commands_conf == "pr_commands" and get_settings().config.disable_auto_feedback:
         get_logger().info(f"Auto feedback is disabled, skipping auto commands for PR {api_url=}", **log_context)
         return
-    commands = get_settings().get(f"azure_devops_server.{commands_conf}")
+    commands = (
+        get_pr_commands("azure_devops_server")
+        if commands_conf == "pr_commands"
+        else get_settings().get(f"azure_devops_server.{commands_conf}")
+    )
     if not commands:
         return
 
@@ -237,7 +250,7 @@ async def handle_request_azure(data, log_context):
         comment_content = comment["content"]
         if (isinstance(comment_content, str)
                 and (available_commands_rgx.match(comment_content) or extract_azure_mention(comment_content))):
-            if(data["resourceVersion"] == "2.0"):
+            if data["resourceVersion"] == "2.0":
                 repo = data["resource"]["pullRequest"]["repository"]["webUrl"]
                 pr_url = unquote(f'{repo}/pullrequest/{data["resource"]["pullRequest"]["pullRequestId"]}')
                 action = comment["content"]
@@ -249,7 +262,9 @@ async def handle_request_azure(data, log_context):
                 # API V1 not supported as it does not contain the PR URL
                 return JSONResponse(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    content=json.dumps({"message": "version 1.0 webhook for Azure Devops PR comment is not supported. please upgrade to version 2.0"})),
+                    content=json.dumps(
+                        {"message": "version 1.0 webhook for Azure Devops PR comment is not supported. "
+                                    "please upgrade to version 2.0"})),
         else:
             return JSONResponse(
                 status_code=status.HTTP_204_NO_CONTENT,
@@ -294,7 +309,9 @@ async def root():
     return {"status": "ok"}
 
 def start():
-    app = FastAPI(middleware=[Middleware(RawContextMiddleware)])
+    app = create_server_app(middleware=[Middleware(RawContextMiddleware)])
+    if prometheus_metrics_enabled():
+        attach_metrics_endpoint(router)
     app.include_router(router)
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "3000")))
 

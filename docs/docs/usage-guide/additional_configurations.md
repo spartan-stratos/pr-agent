@@ -1,6 +1,11 @@
+---
+title: "Additional Configurations"
+sidebar_position: 10
+---
+
 ## Show possible configurations
 
-The possible configurations of PR-Agent are stored in [here](https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/settings/configuration.toml){:target="_blank"}.
+The possible configurations of PR-Agent are stored in <a href="https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/settings/configuration.toml" target="_blank" rel="noopener noreferrer">here</a>.
 In the [tools](../tools/index.md) page you can find explanations on how to use these configurations for each tool.
 
 To print all the available configurations as a comment on your PR, you can use the following command:
@@ -9,7 +14,7 @@ To print all the available configurations as a comment on your PR, you can use t
 /config
 ```
 
-![possible_config1](https://codium.ai/images/pr_agent/possible_config1.png){width=512}
+<img src="/img/possible_config1.png" alt="possible_config1" width="512" />
 
 To view the **actual** configurations used for a specific tool, after all the user settings are applied, you can add for each tool a `--config.output_relevant_configurations=true` suffix.
 For example:
@@ -20,7 +25,7 @@ For example:
 
 Will output an additional field showing the actual configurations used for the `improve` tool.
 
-![possible_config2](https://codium.ai/images/pr_agent/possible_config2.png){width=512}
+<img src="/img/possible_config2.png" alt="possible_config2" width="512" />
 
 ### Showing the agent run details
 
@@ -59,7 +64,7 @@ The amount is an estimate based on LiteLLM's pricing data, not provider-invoice-
 
 Notes:
 
-- `/improve` appends the section only when it publishes a summary comment. If the provider lacks GFM support or `pr_code_suggestions.commitable_code_suggestions` is enabled, `/improve` posts inline comments instead, so no run details section appears.
+- `/improve` appends the section only when it publishes a summary comment. If the provider lacks GFM support or `pr_code_suggestions.committable_code_suggestions` is enabled, `/improve` posts inline comments instead, so no run details section appears.
 - With `pr_description.use_description_markers=true`, repeated `/describe` runs accumulate one run details block per run because the existing PR description is preserved and only the markers are replaced.
 
 ## Ignoring files from analysis
@@ -149,6 +154,8 @@ expand_submodule_diffs = true
 
 When enabled, PR-Agent will fetch and attach diffs from the submodule repositories. The default is `false` to avoid extra GitLab API calls.
 
+Submodule URLs in `.gitmodules` may be absolute (`https://`, `ssh://`, `git@host:`) or relative (`../group/repo.git`). Relative URLs are resolved against the merge request's project path the same way git does, so submodules that live in a sibling group on the same GitLab instance are expanded too.
+
 ## Post the review as a GitLab thread
 
 By default, PR-Agent posts the `/review` summary as a plain note. To post it as a resolvable thread (GitLab discussion) instead, enable (default: `false`):
@@ -160,6 +167,19 @@ publish_review_as_thread = true
 - With `pr_reviewer.persistent_comment=true` (the default), each run updates the existing review thread and reopens it if it was resolved, so the refreshed review gets another look.
 - Enabling the flag does not convert a review that was already posted as a plain note: it keeps being updated in place, and GitLab cannot promote a note to a thread. Only MRs whose first review runs after the flag is set get a thread.
 - Set `pr_reviewer.persistent_comment=false` to open a new review thread on each run instead.
+
+## Reply to the triggering GitLab discussion
+
+By default, `/review` and `/improve` publish a new comment. To reply inside the GitLab discussion that triggered the command, enable (default: `false`):
+
+```toml
+[gitlab]
+reply_to_trigger_comment = true
+```
+
+This is opt-in and GitLab-only. The webhook supplies the discussion ID for top-level `/review` and `/improve` notes. If the ID is unavailable or the reply fails, PR-Agent falls back to a normal note so output is not lost. GitHub Conversation comments do not expose a compatible reply endpoint.
+
+With `persistent_comment=true` (the default for both tools), a rerun updates the earlier result where it was first posted, which may be a different discussion; `/review` also posts a short link to it in the new command's discussion.
 
 ## Post the /improve suggestions as a GitLab thread
 
@@ -322,10 +342,10 @@ callback_timeout_seconds = 30 # default
 
 ## Built-in OpenTelemetry command telemetry
 
-PR-Agent can emit its own [OpenTelemetry](https://opentelemetry.io/) signals for utilization and adoption tracking. These cover the **command** layer — how often each tool runs, on which git provider, and whether it succeeded — which no LLM-level integration can report, because many failures happen before any model call:
+PR-Agent can emit its own [OpenTelemetry](https://opentelemetry.io/) signals for utilization and adoption tracking. These cover the **command** layer — how often each tool runs, on which git provider, whether it succeeded, and how many tokens it consumes — which no LLM-level integration can report, because many failures happen before any model call:
 
 - **Traces**: one span per request, named `pr_agent <command>` (for example `pr_agent review`), carrying `pr_agent.command`, `pr_agent.args_count`, `vcs.provider.name`, a span status, and a bounded `error.type` on failure. Prompt and response content is never attached.
-- **Metrics**: `pr_agent.commands`, a counter of executed commands labeled by command and git provider.
+- **Metrics**: `pr_agent.commands`, a counter of executed commands labeled by command and git provider. `pr_agent.tokens` counts consumed tokens, labeled by command, git provider, `pr_agent.fallback_used` (true or false), and `gen_ai.token.type` (`input`, `output`, `cache_read`, or `cache_creation`). `pr_agent.ai_calls` counts successful model calls, labeled by command, git provider, and `pr_agent.fallback_used`. Zero values are skipped, so providers that do not report usage add no token timeseries (`pr_agent.ai_calls` still counts their calls).
 
 ### Two independent layers
 
@@ -336,7 +356,7 @@ Telemetry is disabled by default. To enable it, set in `configuration.toml`:
 ```toml
 [otel]
 is_enabled = true
-exporter_type = "console" # "console", "otlp", or "none"
+exporter_type = "console" # "console", "otlp", "prometheus", or "none"
 service_name = "pr-agent"
 environment = "development" # e.g. "development", "staging", "production"
 ```
@@ -362,6 +382,29 @@ otlp_protocol = "grpc" # default: "http"
 
 This is the recommended topology for fleets: point every PR-Agent instance at the same collector and aggregate there. Each process creates its own exporter connection; use the `service_name` and `environment` resource attributes to slice instances apart on the backend.
 
+### Exposing native Prometheus metrics
+
+Instead of pushing to a collector, set `exporter_type = "prometheus"` to expose a native `GET /metrics` scrape endpoint on the gunicorn-served apps (`github_app`, `gitlab_webhook`, `azuredevops_server_webhook`, `gitea_app`). The command, token, and AI-call counters are translated into the Prometheus text format, and every gunicorn worker's values are merged at scrape time, so counters stay correct across the process workers:
+
+```toml
+[otel]
+exporter_type = "prometheus"
+prometheus_multiproc_dir = "/tmp/pr-agent-prometheus" # shared, writable by every worker
+```
+
+1. The exporter is metrics-only: command spans are not exported in this mode.
+2. `/metrics` is mounted only when this exporter is selected, so nothing is exposed by default. It does not depend on an OTLP collector or endpoint.
+3. gunicorn registers and deregisters workers' state files automatically (`when_ready`/`child_exit`); a worker that dies mid-scrape leaves only a stale file, which is ignored once it is marked dead.
+4. Metric families are created from the first data point's label set. Later attributes that do not fit the family are dropped, and missing ones are back-filled with an empty string, so a scrape never breaks on drifting label cardinality.
+5. The exporter ships with PR-Agent (it depends on `prometheus-client`); no extra package is required. Scrape it like any exporter:
+
+```yaml
+scrape_configs:
+  - job_name: pr-agent
+    static_configs:
+      - targets: ["pr-agent:3000"]
+```
+
 Privacy controls (both off by default):
 
 - `include_pr_url = true` attaches PR URLs to spans. Off by default because URLs expose private repo names.
@@ -373,11 +416,12 @@ Notes:
 - PR-Agent keeps its own OpenTelemetry providers and never registers the process-global one, so embedding PR-Agent in an application that already uses OpenTelemetry will not interfere with the host's telemetry. Pending spans and metrics are flushed automatically on process exit.
 - Each OTLP export call is bounded by `otlp_timeout` (default 3 seconds, retries included), so an unreachable collector cannot hang CLI exit or request completion. Raise it for slow collectors at the cost of longer worst-case stalls.
 - If `exporter_type = "otlp"` is set but no endpoint is configured, telemetry is disabled entirely (fail closed) — it never falls back to another exporter, so a missing secret cannot redirect telemetry into process logs.
+- With `exporter_type = "prometheus"`, `prometheus_multiproc_dir` must be a shared directory writable by every worker; it defaults to `/tmp/pr-agent-prometheus`. In non-gunicorn (single-process) deployments the exporter works without it and simply serves the process's own registry.
 - **Serverless deployments** (e.g. the AWS Lambda webhooks) are supported: buffered spans and metrics are force-flushed at the end of every handled request, because frozen execution environments stop background export threads and are reaped without running exit handlers. No extra configuration is needed.
 
 ## Bringing per-repo context files to PR-Agent
 
-`Platforms supported: GitHub, GitLab, Gitea, Bitbucket, Azure DevOps`
+`Platforms supported: GitHub, GitLab, Gitea, Bitbucket, Azure DevOps, Local`
 
 To give PR-Agent's tools additional project context, you can have it include repository instruction files — such as [AGENTS.md](https://agents.md/) or [CLAUDE.md](https://www.anthropic.com/engineering/claude-code-best-practices) — in the prompts for the `/review`, `/describe` and `/improve` tools.
 
@@ -395,15 +439,18 @@ You can list any repository-relative paths. By default the files are read from t
 repo_context_files = ["AGENTS.md", "CLAUDE.md", "docs/conventions.md"]
 ```
 
-!!! note "Which branch the files are read from"
-    By default (`repo_context_from_default_branch = true`), instruction files are read from the repository's **default branch** — a single trusted source — so neither the PR nor its target branch can alter the guidance used to review it. This matches how Qodo Merge reads these files.
+:::note[Which branch the files are read from]
+By default (`repo_context_from_default_branch = true`), instruction files are read from the repository's **default branch** — a single trusted source — so neither the PR nor its target branch can alter the guidance used to review it. This matches how Qodo Merge reads these files.
 
-    Set `repo_context_from_default_branch = false` to instead read from the PR's **target (base) branch**. This respects branch-specific instructions (for example a release branch, or a stacked PR that carries its own `AGENTS.md`), at the cost of trusting whoever can write to that target branch. Even then, files are never read from the PR's own head.
+Set `repo_context_from_default_branch = false` to instead read from the PR's **target (base) branch**. This respects branch-specific instructions (for example a release branch, or a stacked PR that carries its own `AGENTS.md`), at the cost of trusting whoever can write to that target branch. Even then, files are never read from the PR's own head.
 
-    ```toml
-    [config]
-    repo_context_from_default_branch = false
-    ```
+The local git provider has no separate default branch, so it always reads instruction files from the committed target branch (the branch passed as `--pr_url`), never from `HEAD` or uncommitted changes.
+
+```toml
+[config]
+repo_context_from_default_branch = false
+```
+:::
 
 To bound how much of this context is sent to the model, `repo_context_max_lines` (default `500`) caps the total number of rendered lines, including the wrapper tags. Content beyond the budget is truncated safely:
 
@@ -411,6 +458,41 @@ To bound how much of this context is sent to the model, `repo_context_max_lines`
 [config]
 repo_context_max_lines = 500
 ```
+
+### Context from sibling repositories
+
+The host operator must first approve repositories in the deployment configuration:
+
+```toml
+[config]
+repo_context_sibling_repos = ["my-group/library"]
+repo_context_max_sibling_files = 5
+```
+
+Approve only repositories whose contents may appear in reviews of consuming repositories.
+This allowlist and the fetch limit cannot be changed by repository settings or comment arguments.
+An empty allowlist disables sibling reads.
+
+A consuming repository can then select files in its `.pr_agent.toml` as structured
+`repo_context_files` entries:
+
+```toml
+[config]
+repo_context_files = [
+    "AGENTS.md",
+    {repo_id = "my-group/library", file_path = "src/api.py"},
+]
+```
+
+Use `owner/repository` on GitHub or a full project path on GitLab. GitLab also accepts numeric
+project IDs as strings, provided the same identifier is in the host allowlist. Resolved repositories
+must share the current repository's owning namespace: the GitHub owner or GitLab top-level group,
+including projects in different subgroups. Renamed or redirected paths must be updated to their
+canonical names in both settings.
+
+Sibling files always come from their default branch and share `repo_context_max_lines` with local
+files. Private and internal repositories also require requester access. Comment arguments cannot
+override `repo_context_files` at all; a repository's `.pr_agent.toml` may still set it.
 
 ## Ignoring automatic commands in PRs
 
@@ -502,8 +584,9 @@ ignore_pr_authors = ["my-special-bot-user", ...]
 
 Where the `ignore_pr_authors` is a regex list of usernames that you want to ignore.
 
-!!! note
-    There is one specific case where bots will receive an automatic response - when they generated a PR with a _failed test_.
+:::note
+There is one specific case where bots will receive an automatic response - when they generated a PR with a _failed test_.
+:::
 
 ### Ignoring Generated Files by Language/Framework
 
@@ -516,19 +599,6 @@ ignore_language_framework = ['protobuf', ...]
 
 You can view the list of auto-generated file patterns in [`generated_code_ignore.toml`](https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/settings/generated_code_ignore.toml).
 Files matching these glob patterns will be automatically excluded from PR Agent analysis.
-
-### Ignoring Tickets with Specific Labels
-
-When PR-Agent analyzes tickets (JIRA, GitHub Issues, GitLab Issues, etc.) referenced in your PR, you may want to exclude tickets that have certain labels from the analysis. This is useful for filtering out tickets marked as "ignore-compliance", "skip-review", or other labels that indicate the ticket should not be considered during PR review.
-
-To ignore tickets with specific labels, add the following to your `configuration.toml` file:
-
-```toml
-[config]
-ignore_ticket_labels = ["ignore-compliance", "skip-review", "wont-fix"]
-```
-
-Where `ignore_ticket_labels` is a list of label names that should be ignored during ticket analysis.
 
 ### Restricted Mode
 

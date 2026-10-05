@@ -1,9 +1,13 @@
+import io
+import sys
+
 import pytest
 
 from pr_agent.algo.types import EDIT_TYPE
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import _GIT_PROVIDERS
 from pr_agent.git_providers.plain_diff_provider import PlainDiffGitProvider
+from pr_agent.tools.pr_code_suggestions import PRCodeSuggestions
 
 # Diff-mode settings keys these tests mutate on the process-wide singleton.
 _SETTINGS_KEYS = ["plain_diff.content", "plain_diff.output_path",
@@ -157,6 +161,20 @@ def test_publish_comment_to_file(cfg, tmp_path):
     assert "saved" in out.read_text(encoding="utf-8")
 
 
+def test_publish_comment_survives_stdout_that_cannot_encode(cfg, tmp_path, monkeypatch):
+    # Simulate a redirected Windows stdout (cp1252) and check that emoji in tool
+    # output neither abort publishing nor skip the --output file.
+    raw = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="cp1252"))
+    out = tmp_path / "review.md"
+    cfg("plain_diff.content", DIFF)
+    cfg("plain_diff.output_path", str(out))
+    provider = PlainDiffGitProvider(None)
+    provider.publish_comment("## ✨ Review\nlooks good")
+    assert raw.getvalue().decode("utf-8") == "## ✨ Review\nlooks good\n"
+    assert out.read_text(encoding="utf-8") == "## ✨ Review\nlooks good"
+
+
 def test_empty_diff_raises(cfg):
     cfg("plain_diff.content", "")
     cfg("plain_diff.output_path", None)
@@ -171,13 +189,6 @@ def test_temporary_comment_not_emitted(cfg, capsys):
     provider.publish_comment("Preparing review...", is_temporary=True)
     captured = capsys.readouterr()
     assert "Preparing review" not in captured.out
-
-
-def test_publish_file_comments_not_supported(cfg):
-    cfg("plain_diff.content", DIFF)
-    cfg("plain_diff.output_path", None)
-    provider = PlainDiffGitProvider(None)
-    assert provider.is_supported("publish_file_comments") is False
 
 
 def test_path_traversal_file_not_read(cfg, tmp_path, monkeypatch):
@@ -264,9 +275,11 @@ def test_publish_code_suggestions_renders_to_stdout(cfg, capsys):
     # render the suggestions to stdout.
     assert provider.publish_code_suggestions(suggestions) is True
     out = capsys.readouterr().out
-    assert "Code suggestions" in out
-    assert "foo.py:2-2" in out
-    assert "use a constant" in out
+    assert out == (
+        "## Code suggestions\n\n"
+        "### foo.py:2-2\n"
+        "**Suggestion:** use a constant\n\n"
+    )
 
 
 def test_publish_code_suggestions_empty_is_noop(cfg, capsys):
@@ -275,6 +288,61 @@ def test_publish_code_suggestions_empty_is_noop(cfg, capsys):
     provider = PlainDiffGitProvider(None)
     assert provider.publish_code_suggestions([]) is True
     assert capsys.readouterr().out.strip() == ""
+
+
+@pytest.mark.asyncio
+async def test_partial_improve_keeps_suggestions_and_coverage_in_one_output(cfg, capsys, tmp_path):
+    output = tmp_path / "suggestions.md"
+    cfg("plain_diff.content", DIFF)
+    cfg("plain_diff.output_path", str(output))
+    provider = PlainDiffGitProvider(None)
+    assert provider.supports_code_suggestions_artifact() is True
+    tool = object.__new__(PRCodeSuggestions)
+    tool.git_provider = provider
+    tool.failed_chunk_count = 1
+    tool.total_chunk_count = 2
+    tool.progress_response = None
+    tool._output_published = False
+    tool._validate_suggestion = lambda *args: (True, "", True)
+
+    await tool.push_inline_code_suggestions({"code_suggestions": [{
+        "relevant_file": "foo.py",
+        "relevant_lines_start": 2,
+        "relevant_lines_end": 2,
+        "suggestion_content": "Use a constant",
+        "improved_code": "",
+        "existing_code": "line2-changed",
+        "label": "maintainability",
+        "score": 8,
+    }]})
+
+    content = output.read_text(encoding="utf-8")
+    stdout = capsys.readouterr().out
+    for rendered in (content, stdout):
+        assert rendered.count("Use a constant") == 1
+        assert rendered.count("foo.py:2-2") == 1
+        assert rendered.count("1 of 2 analysis chunks failed") == 1
+        assert rendered.index("Use a constant") < rendered.index("1 of 2 analysis chunks failed")
+
+
+@pytest.mark.asyncio
+async def test_partial_improve_without_suggestions_keeps_coverage_in_artifact(cfg, capsys, tmp_path):
+    output = tmp_path / "suggestions.md"
+    cfg("plain_diff.content", DIFF)
+    cfg("plain_diff.output_path", str(output))
+    provider = PlainDiffGitProvider(None)
+    tool = object.__new__(PRCodeSuggestions)
+    tool.git_provider = provider
+    tool.failed_chunk_count = 1
+    tool.total_chunk_count = 2
+
+    await tool.publish_no_suggestions()
+
+    content = output.read_text(encoding="utf-8")
+    stdout = capsys.readouterr().out
+    for rendered in (content, stdout):
+        assert rendered.count("No code suggestions found in the successfully analyzed chunks.") == 1
+        assert rendered.count("1 of 2 analysis chunks failed") == 1
 
 
 def test_incremental_review_disabled(cfg):

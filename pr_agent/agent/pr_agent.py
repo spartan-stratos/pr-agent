@@ -1,18 +1,33 @@
 import asyncio
+import copy
 import json
 import shlex
 from functools import partial
 
+import dynaconf
 from opentelemetry.trace import StatusCode
+from starlette_context import context, request_cycle_context
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
+from pr_agent.algo.artifacts import reapply_artifact_context
 from pr_agent.algo.cli_args import CliArgs
+from pr_agent.algo.comment_identity import (
+    add_comment_identity,
+    comment_matches_identity,
+)
+from pr_agent.algo.run_details import get_run_details, init_run_details
 from pr_agent.algo.utils import update_settings_from_args
-from pr_agent.config_loader import get_settings
+from pr_agent.config_loader import get_settings, global_settings
+from pr_agent.git_providers import get_git_provider_with_context
+from pr_agent.git_providers.git_provider import (
+    IncompleteBitbucketPullRequestFilesError as _IncompleteBitbucketPullRequestFilesError,
+)
+from pr_agent.git_providers.git_provider import IncompleteProviderPullRequestFilesError
+from pr_agent.git_providers.git_provider import IncompletePullRequestFilesError as _IncompletePullRequestFilesError
 from pr_agent.git_providers.utils import apply_repo_settings
 from pr_agent.log import get_logger
-from pr_agent.telemetry.meter import get_commands_counter
+from pr_agent.telemetry.meter import get_ai_calls_counter, get_commands_counter, get_tokens_counter
 from pr_agent.telemetry.shutdown import flush_telemetry
 from pr_agent.telemetry.tracer import get_tracer
 from pr_agent.tools.pr_add_docs import PRAddDocs
@@ -26,6 +41,11 @@ from pr_agent.tools.pr_questions import PRQuestions
 from pr_agent.tools.pr_reviewer import PRReviewer
 from pr_agent.tools.pr_similar_issue import PRSimilarIssue
 from pr_agent.tools.pr_update_changelog import PRUpdateChangelog
+
+# Keep the established import path available to integrations and tests while the
+# shared handler works against the provider-neutral base exception.
+IncompleteBitbucketPullRequestFilesError = _IncompleteBitbucketPullRequestFilesError
+IncompletePullRequestFilesError = _IncompletePullRequestFilesError
 
 command2class = {
     "auto_review": PRReviewer,
@@ -53,6 +73,64 @@ command2class = {
 
 commands = list(command2class.keys())
 
+def publish_incomplete_files_comment(
+    pr_url: str, error: IncompleteProviderPullRequestFilesError
+) -> None:
+    """Publish one trusted, sanitized provider notice without replacing the primary failure."""
+    try:
+        _publish_incomplete_files_comment(pr_url, error)
+    except Exception:
+        # Preserve the original completeness failure by containing every
+        # ordinary provider or rendering failure from this secondary notice.
+        get_logger().exception("Failed to prepare the incomplete-files notice")
+
+
+def _publish_incomplete_files_comment(
+    pr_url: str, error: IncompleteProviderPullRequestFilesError
+) -> None:
+    if not get_settings().get("CONFIG.PUBLISH_OUTPUT", True):
+        return
+
+    try:
+        provider = get_git_provider_with_context(pr_url)
+    except Exception:
+        get_logger().exception("Failed to get a provider for the incomplete-files notice")
+        return
+
+    try:
+        comments = provider.get_issue_comments_newest_first()
+    except Exception:
+        get_logger().exception("Failed to inspect existing incomplete-files notices")
+        comments = []
+
+    for comment in comments:
+        try:
+            body = provider._get_comment_body(comment)
+        except Exception:
+            # Ignore comments whose bodies cannot be read. Continue looking
+            # for a verifiable PR-Agent marker and publish if none can be
+            # confirmed.
+            get_logger().warning(
+                "Failed to read an existing incomplete-files notice; continuing"
+            )
+            continue
+        if not comment_matches_identity(body, error.notice_marker):
+            continue
+        try:
+            if provider.is_comment_authored_by_pr_agent(comment):
+                return
+        except Exception:
+            get_logger().exception("Failed to verify the author of an incomplete-files notice")
+
+    body = add_comment_identity(
+        error.notice,
+        error.notice_marker,
+        provider,
+    )
+    try:
+        provider.publish_comment(body)
+    except Exception:
+        get_logger().exception("Failed to publish the incomplete-files notice")
 
 def _split_command(command: str) -> list[tuple[str, bool]]:
     """Split an auto command and retain whether each token was quoted.
@@ -138,15 +216,8 @@ def _split_command(command: str) -> list[tuple[str, bool]]:
     return tokens
 
 
-def prepare_command(command: str) -> list[str]:
-    """Apply command-line settings while preserving quoted argument boundaries.
-
-    Webhook adapters use this before handing configured commands to ``PRAgent``. Parsing
-    with ``str.split(" ")`` breaks values such as ``--section.key=\"words with spaces\"``;
-    the tokenizer keeps the value as one argument and preserves explicit quoting for YAML.
-    Returning the token list avoids serializing it back to a string, which would otherwise
-    be re-parsed by ``PRAgent`` and could alter quoted arguments.
-    """
+def parse_command(command: str) -> list[str]:
+    """Normalize configured command strings to argv without applying settings."""
     tokens = _split_command(command)
     if not tokens:
         return []
@@ -158,8 +229,75 @@ def prepare_command(command: str) -> list[str]:
             key, value = argument.split("=", 1)
             argument = f"{key}={json.dumps(value, ensure_ascii=False)}"
         args.append(argument)
-    other_args = update_settings_from_args(args)
-    return [action] + other_args
+    return [action] + args
+
+
+def _validation_args(args: list[str]) -> list[str]:
+    """Project setting arguments to their keys for command-line validation.
+
+    A mapping value sets many keys at once, so it is kept whole and every nested
+    ``section.key`` path is validated instead of only the section before ``=``.
+    """
+    return [
+        argument if CliArgs.is_mapping_arg(argument) else argument.split("=", 1)[0]
+        for argument in args
+    ]
+
+
+def prepare_command(command: str) -> list[str]:
+    """Apply validated automatic overrides and retain them for dispatch.
+
+    Apply settings now so they can control repository loading. Return the same
+    argv so ``PRAgent`` reapplies overrides after repository settings are loaded.
+    Quoted setting values retain their string type.
+    """
+    command_args = parse_command(command)
+    if not command_args:
+        return []
+    action, *args = command_args
+    kept, rejected = [], []
+    for argument in args:
+        # Validate the key only. The value is free text - a review instruction may legitimately
+        # mention openai.key or config.url - and only the key can actually set a setting.
+        is_allowed, offending_param = CliArgs.validate_user_args(_validation_args([argument]))
+        if is_allowed:
+            kept.append(argument)
+        else:
+            rejected.append(offending_param)
+    if rejected:
+        get_logger().error(
+            "Dropping auto-command argument(s) targeting forbidden param(s): "
+            + ", ".join(f"'{param}'" for param in rejected))
+    update_settings_from_args(kept)
+    return [action] + kept
+
+
+def _record_token_metrics(action: str, git_provider: str) -> None:
+    """Export the run's token usage through the OTel counters, if any was collected.
+
+    Repo and PR stay out of the labels on purpose: they are high-cardinality, the same
+    reason the command counter omits them. Zero values are skipped, so a provider that
+    reports no usage adds nothing.
+    """
+    details = get_run_details()
+    if details is None:
+        return
+    labels = {
+        "pr_agent.command": action,
+        "vcs.provider.name": git_provider,
+        "pr_agent.fallback_used": details.fallback_used,
+    }
+    tokens_counter = get_tokens_counter()
+    for token_type, count in (
+        ("input", details.prompt_tokens),
+        ("output", details.completion_tokens),
+        ("cache_read", details.cache_read_tokens),
+        ("cache_creation", details.cache_creation_tokens),
+    ):
+        if count:
+            tokens_counter.add(count, {**labels, "gen_ai.token.type": token_type})
+    if details.num_ai_calls:
+        get_ai_calls_counter().add(details.num_ai_calls, labels)
 
 
 def get_ai_handler() -> partial:
@@ -174,7 +312,9 @@ class PRAgent:
     def __init__(self, ai_handler: partial[BaseAiHandler,] = None):
         self.ai_handler = ai_handler if ai_handler is not None else get_ai_handler()
 
-    async def _handle_request(self, pr_url, request, notify=None) -> bool:
+    async def _handle_request(
+        self, pr_url, request, notify=None, propagate_tool_errors: bool | None = None
+    ) -> bool:
         # Exceptions raised inside are caught below, but a BaseException (e.g. the
         # CancelledError a webhook timeout raises) still escapes the span, and the SDK
         # would auto-record its message and stacktrace — request content, so opt-in.
@@ -187,9 +327,23 @@ class PRAgent:
             if get_settings().get("OTEL.INCLUDE_PR_URL", False):
                 span.set_attribute("pr_agent.pr_url", pr_url)
             try:
-                return await self._run_command(pr_url, request, notify, span)
+                if propagate_tool_errors is None:
+                    return await self._run_command(pr_url, request, notify, span)
+                try:
+                    context["settings"]
+                except Exception:
+                    # Create request-local settings before awaiting commands outside middleware.
+                    with request_cycle_context({"settings": copy.deepcopy(global_settings)}):
+                        return await self._run_command(
+                            pr_url, request, notify, span, propagate_tool_errors=propagate_tool_errors
+                        )
+                return await self._run_command(
+                    pr_url, request, notify, span, propagate_tool_errors=propagate_tool_errors
+                )
             except Exception as e:
                 get_logger().exception("Failed to process the command.")
+                if isinstance(e, IncompleteProviderPullRequestFilesError):
+                    await asyncio.to_thread(publish_incomplete_files_comment, pr_url, e)
                 # Status carries no description: it is free text, and the exception
                 # message can embed PR URLs, repo names, or other request content.
                 span.set_status(StatusCode.ERROR)
@@ -199,21 +353,28 @@ class PRAgent:
                     span.record_exception(e)
                 return False
 
-    async def _run_command(self, pr_url, request, notify, span) -> bool:
+    async def _run_command(
+        self, pr_url, request, notify, span, propagate_tool_errors: bool | None = None
+    ) -> bool:
         # First, apply repo specific settings if exists
         apply_repo_settings(pr_url)
 
         # Then, apply user specific settings if exists
         if isinstance(request, str):
-            request = request.replace("'", "\\'")
             lexer = shlex.shlex(request, posix=True)
             lexer.whitespace_split = True
+            # Keep apostrophes literal without adding backslashes inside double quotes.
+            lexer.quotes = '"'
+            # Treat "#" as ordinary text. shlex drops it and everything after it as a shell
+            # comment, which silently truncated questions such as "/ask what does #123 do?".
+            # This input is a single already-parsed command, never a shell script.
+            lexer.commenters = ''
             action, *args = list(lexer)
         else:
             action, *args = request
 
         # validate args
-        is_valid, arg = CliArgs.validate_user_args(args)
+        is_valid, arg = CliArgs.validate_user_args(_validation_args(args))
         if not is_valid:
             get_logger().error(
                 f"CLI argument for param '{arg}' is forbidden. Use instead a configuration file."
@@ -232,13 +393,15 @@ class PRAgent:
             get_logger().info(f'User has set the response language to: {response_language}')
             for key in get_settings():
                 setting = get_settings().get(key)
-                if str(type(setting)) == "<class 'dynaconf.utils.boxing.DynaBox'>":
+                if isinstance(setting, dynaconf.DataDict):
                     if hasattr(setting, 'extra_instructions'):
                         current_extra_instructions = setting.extra_instructions
 
                         # Define the language-specific instruction and the separator
                         lang_instruction_text = (f"Your response MUST be written in the language corresponding "
-                                                 f"to locale code: '{response_language}'. This is crucial.")
+                                                 f"to locale code: '{response_language}'. This is crucial. "
+                                                 f"Keep schema control values (such as 'No', 'Yes', 'None', "
+                                                 f"'false') in their original English form and do not translate them.")
                         separator_text = "\n======\n\nIn addition, "
 
                         # Check if the specific language instruction is already present to avoid duplication
@@ -264,32 +427,59 @@ class PRAgent:
                 span.set_attribute("error.message", f"Unknown command: {action}")
             return False
 
+        reapply_artifact_context()
+
         # Only after validation: an unknown action is arbitrary user input and
         # must not become a span name, span attribute, or metric label.
         span.update_name(f"pr_agent {action}")
         span.set_attribute("pr_agent.command", action)
         get_commands_counter().add(1, {"pr_agent.command": action, "vcs.provider.name": _git_provider})
 
-        with get_logger().contextualize(command=action, pr_url=pr_url):
-            get_logger().info("PR-Agent request handler started", analytics=True)
-            if action == "answer":
-                if notify:
-                    notify()
-                await PRReviewer(pr_url, is_answer=True, args=args, ai_handler=self.ai_handler).run()
-            elif action == "auto_review":
-                await PRReviewer(pr_url, is_auto=True, args=args, ai_handler=self.ai_handler).run()
-            else:
-                if notify:
-                    notify()
-
-                await command2class[action](pr_url, ai_handler=self.ai_handler, args=args).run()
-
-            span.set_status(StatusCode.OK)
-            return True
-
-    async def handle_request(self, pr_url, request, notify=None) -> bool:
+        settings = get_settings()
+        if propagate_tool_errors is not None:
+            # Apply this after repository and command settings so callers that require an honest
+            # result cannot be overridden by either source. Restore it below for request isolation.
+            previous_propagation = settings.get("CONFIG.PROPAGATE_TOOL_ERRORS", False)
+            settings.set("CONFIG.PROPAGATE_TOOL_ERRORS", propagate_tool_errors)
+        # Install a fresh collector at the per-command boundary so the finally block
+        # exports this command's usage and never repeats or inherits a prior command's
+        # counts. Tools that run their own collector (e.g. /review) replace it on entry.
+        init_run_details()
         try:
-            return await self._handle_request(pr_url, request, notify)
+            with get_logger().contextualize(command=action, pr_url=pr_url):
+                get_logger().info("PR-Agent request handler started", analytics=True)
+                if action == "answer":
+                    if notify:
+                        notify()
+                    await PRReviewer(pr_url, is_answer=True, args=args, ai_handler=self.ai_handler).run()
+                elif action == "auto_review":
+                    await PRReviewer(pr_url, is_auto=True, args=args, ai_handler=self.ai_handler).run()
+                else:
+                    if notify:
+                        notify()
+
+                    result = await command2class[action](pr_url, ai_handler=self.ai_handler, args=args).run()
+                    if action == "add_docs" and result is False:
+                        span.set_status(StatusCode.ERROR)
+                        span.set_attribute("error.type", "documentation_publication_failed")
+                        return False
+
+                span.set_status(StatusCode.OK)
+                return True
+        finally:
+            _record_token_metrics(action, _git_provider)
+            if propagate_tool_errors is not None:
+                settings.set("CONFIG.PROPAGATE_TOOL_ERRORS", previous_propagation)
+
+    async def handle_request(
+        self, pr_url, request, notify=None, propagate_tool_errors: bool | None = None
+    ) -> bool:
+        try:
+            if propagate_tool_errors is None:
+                return await self._handle_request(pr_url, request, notify)
+            return await self._handle_request(
+                pr_url, request, notify, propagate_tool_errors=propagate_tool_errors
+            )
         except Exception:
             # _handle_request already catches command failures and annotates the span;
             # this is the outer contract every caller relies on — webhook handlers and

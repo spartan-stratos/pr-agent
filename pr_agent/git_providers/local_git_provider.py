@@ -1,13 +1,14 @@
 from collections import Counter
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from git import Repo
 
+from pr_agent.algo.comment_identity import format_pr_code_suggestions_header
 from pr_agent.algo.file_filter import filter_ignored
 from pr_agent.algo.language_handler import build_language_file_matcher
+from pr_agent.algo.run_output import show_run_details
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
-from pr_agent.algo.utils import format_pr_code_suggestions_header, show_run_details
 from pr_agent.config_loader import _find_repository_root, get_settings
 from pr_agent.git_providers.git_provider import GitProvider
 from pr_agent.log import get_logger
@@ -93,6 +94,10 @@ class LocalGitProvider(GitProvider):
         return True
 
     def get_diff_files(self) -> list[FilePatchInfo]:
+        cached_diff_files = getattr(self, "diff_files", None)
+        if cached_diff_files is not None:
+            return cached_diff_files
+
         diffs = self.repo.head.commit.diff(
             self.repo.merge_base(self.repo.head, self.repo.branches[self.target_branch_name]),
             create_patch=True,
@@ -144,12 +149,13 @@ class LocalGitProvider(GitProvider):
             self.repo.merge_base(self.repo.head, self.repo.branches[self.target_branch_name]),
             R=True
         )
-        # Get the list of changed files
-        diff_files = [item.a_path for item in diff_index]
+        # Use the current path for renames and modifications; deleted files
+        # have no new-side path and therefore fall back to their old path.
+        diff_files = [item.b_path or item.a_path for item in diff_index]
         return diff_files
 
     def publish_description(self, pr_title: str, pr_body: str):
-        with open(self.description_path, "w") as file:
+        with open(self.description_path, "w", encoding="utf-8") as file:
             title = self.get_pr_title() if pr_title is None else pr_title
             file.write(title + '\n' + pr_body)
 
@@ -162,15 +168,15 @@ class LocalGitProvider(GitProvider):
             # Write the string to the file
             file.write(pr_comment)
 
-    def publish_inline_comment(self, body: str, relevant_file: str, relevant_line_in_file: str, original_suggestion=None):
+    def supports_comment_publish_confirmation(self) -> bool:
+        return False
+
+    def publish_inline_comment(self, body: str, relevant_file: str,
+                               relevant_line_in_file: str, original_suggestion=None):
         raise NotImplementedError('Publishing inline comments is not implemented for the local git provider')
 
     def publish_inline_comments(self, comments: list[dict]):
         raise NotImplementedError('Publishing inline comments is not implemented for the local git provider')
-
-    def publish_code_suggestion(self, body: str, relevant_file: str,
-                                relevant_lines_start: int, relevant_lines_end: int):
-        raise NotImplementedError('Publishing code suggestions is not implemented for the local git provider')
 
     def publish_code_suggestions(self, code_suggestions: list) -> bool:
         return self.publish_code_suggestions_artifact(code_suggestions)
@@ -217,17 +223,17 @@ class LocalGitProvider(GitProvider):
     def remove_comment(self, comment):
         pass  # Not applicable to the local git provider, but required by the interface
 
-    def add_eyes_reaction(self, comment):
-        pass  # Not applicable to the local git provider, but required by the interface
+    def add_eyes_reaction(self, issue_comment_id: int, disable_eyes: bool = False) -> Optional[int]:
+        return None  # Not applicable to the local git provider, but required by the interface
 
-    def get_commit_messages(self):
-        pass  # Not applicable to the local git provider, but required by the interface
+    def get_commit_messages(self) -> str:
+        return ""  # Not applicable to the local git provider, but required by the interface
 
     def get_repo_settings(self):
         pass  # Not applicable to the local git provider, but required by the interface
 
-    def remove_reaction(self, comment):
-        pass  # Not applicable to the local git provider, but required by the interface
+    def remove_reaction(self, issue_comment_id: int, reaction_id: int) -> bool:
+        return True  # Not applicable to the local git provider, but required by the interface
 
     def get_languages(self):
         """
@@ -256,7 +262,25 @@ class LocalGitProvider(GitProvider):
         return {lang: count / total * 100 for lang, count in lang_count.items()}
 
     def get_pr_branch(self):
-        return self.repo.head
+        return self.head_branch_name
+
+    def get_repo_file_content(self, file_path: str, from_default_branch: bool = False) -> str:
+        """Get content of a file from the target branch.
+
+        Reads the committed target-branch version, never HEAD or the working tree, so the
+        reviewed changes cannot supply their own instruction files. A local checkout has no
+        separate default branch, so from_default_branch reads the target branch as well.
+        """
+        try:
+            blob = self.repo.commit(self.target_branch_name).tree / file_path
+        except KeyError:
+            return ""
+        if blob.type != "blob":
+            return ""
+        return blob.data_stream.read().decode("utf-8", errors="replace")
+
+    def get_repo_context_ref(self, from_default_branch: bool = False) -> Optional[str]:
+        return self.repo.commit(self.target_branch_name).hexsha
 
     def get_user_id(self):
         return -1  # Not used anywhere for the local provider, but required by the interface

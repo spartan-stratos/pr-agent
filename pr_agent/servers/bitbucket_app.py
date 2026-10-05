@@ -6,13 +6,12 @@ import hashlib
 import json
 import math
 import os
-import re
 import time
 
 import jwt
 import requests
 import uvicorn
-from fastapi import APIRouter, FastAPI, Request, Response
+from fastapi import APIRouter, Request, Response
 from starlette.background import BackgroundTasks
 from starlette.middleware import Middleware
 from starlette.responses import JSONResponse
@@ -26,6 +25,13 @@ from pr_agent.identity_providers import get_identity_provider
 from pr_agent.identity_providers.identity_provider import Eligibility
 from pr_agent.log import LoggingFormat, get_logger, setup_logger
 from pr_agent.secret_providers import get_secret_provider, validate_secret_provider_setting
+from pr_agent.servers.request_body_limit import create_server_app
+from pr_agent.servers.utils import (
+    get_pr_commands,
+    is_command_comment,
+    push_trigger_slot,
+    shared_should_process_pr_logic,
+)
 
 setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "DEBUG"))
 router = APIRouter()
@@ -107,6 +113,18 @@ async def handle_manifest(request: Request, response: Response):
     return JSONResponse(manifest_obj)
 
 
+def _payload_log_summary(data: object) -> dict:
+    if not isinstance(data, dict):
+        return {"payload_type": type(data).__name__}
+
+    summary = {"payload_keys": sorted(data.keys())}
+    for field in ("clientKey", "event"):
+        value = data.get(field)
+        if isinstance(value, str):
+            summary[field] = value
+    return summary
+
+
 def _get_username(data):
     actor = data.get("data", {}).get("actor", {})
     if actor:
@@ -150,10 +168,12 @@ async def _validate_time_from_last_commit_to_pr_update(data: dict) -> bool:
         username =_get_username(data)
         commits_data = response.json() or {}
         values = commits_data.get('values') or []
-        if (not values or not isinstance(values, list) or not values[0].get('author') or not values[0]['author'].get('user')
+        if (not values or not isinstance(values, list)
+                or not values[0].get('author') or not values[0]['author'].get('user')
                 or not values[0]['author']['user'].get('display_name')):
-            get_logger().warning("No commits returned for pull request or one of the required fields missing; skipping push validation",
-                                 artifact={'values': values})
+            get_logger().warning(
+                "No commits returned for pull request or one of the required fields missing; skipping push validation",
+                artifact={'values': values})
             return False
         commit_username = commits_data['values'][0]['author']['user']['display_name']
         if username != commit_username:
@@ -179,7 +199,8 @@ async def _validate_time_from_last_commit_to_pr_update(data: dict) -> bool:
 
 async def _perform_commands_bitbucket(commands_conf: str, agent: PRAgent, api_url: str, log_context: dict, data: dict):
     apply_repo_settings(api_url)
-    if commands_conf == "pr_commands" and get_settings().config.disable_auto_feedback:  # auto commands for PR, and auto feedback is disabled
+    # auto commands for PR, and auto feedback is disabled
+    if commands_conf == "pr_commands" and get_settings().config.disable_auto_feedback:
         get_logger().info(f"Auto feedback is disabled, skipping auto commands for PR {api_url=}")
         return
     if commands_conf == "push_commands":
@@ -187,16 +208,35 @@ async def _perform_commands_bitbucket(commands_conf: str, agent: PRAgent, api_ur
             get_logger().info(
                 "Bitbucket push trigger handling disabled via config; skipping push commands")
             return
-    if data.get("event", "") == "pullrequest:created":
-        if not should_process_pr_logic(data):
-            return
-    commands = get_settings().get(f"bitbucket_app.{commands_conf}", {})
+    # Filter both command types here, after apply_repo_settings, so repository-level
+    # ignore rules (ignore_pr_authors, ignore_pr_title, branch filters) also cover
+    # push commands on 'pullrequest:updated', like the other servers already do.
+    if not should_process_pr_logic(data):
+        return
+    commands = (
+        get_pr_commands("bitbucket_app")
+        if commands_conf == "pr_commands"
+        else get_settings().get(f"bitbucket_app.{commands_conf}", {})
+    )
+    if not commands:
+        get_logger().info(f"No {commands_conf} configured, skipping auto commands")
+        return
     get_settings().set("config.is_auto_command", True)
     if commands_conf == "push_commands":
         is_valid_push = await _validate_time_from_last_commit_to_pr_update(data)
         if not is_valid_push:
             get_logger().info("Bitbucket skipping 'pullrequest:updated' for push commands")
             return
+        # Validate the event before waiting: a backlog delegate processes the latest
+        # commits, which may be newer than this webhook's updated_on timestamp.
+        async with push_trigger_slot(api_url, allow_backlog=True, ttl=300) as proceed:
+            if proceed:
+                await _run_commands_bitbucket(commands, agent, api_url, log_context)
+    else:
+        await _run_commands_bitbucket(commands, agent, api_url, log_context)
+
+
+async def _run_commands_bitbucket(commands, agent: PRAgent, api_url: str, log_context: dict):
     for command in commands:
         try:
             new_command = prepare_command(command)
@@ -221,51 +261,7 @@ def is_bot_user(data) -> bool:
 
 
 def should_process_pr_logic(data) -> bool:
-    try:
-        pr_data = data.get("data", {}).get("pullrequest", {})
-        title = pr_data.get("title", "")
-        source_branch = pr_data.get("source", {}).get("branch", {}).get("name", "")
-        target_branch = pr_data.get("destination", {}).get("branch", {}).get("name", "")
-        sender = _get_username(data)
-        repo_full_name = pr_data.get("destination", {}).get("repository", {}).get("full_name", "")
-
-        # logic to ignore PRs from specific repositories
-        ignore_repos = get_settings().get("CONFIG.IGNORE_REPOSITORIES", [])
-        if repo_full_name and ignore_repos:
-            if any(re.search(regex, repo_full_name) for regex in ignore_repos):
-                get_logger().info(f"Ignoring PR from repository '{repo_full_name}' due to 'config.ignore_repositories' setting")
-                return False
-
-        # logic to ignore PRs from specific users
-        ignore_pr_users = get_settings().get("CONFIG.IGNORE_PR_AUTHORS", [])
-        if ignore_pr_users and sender:
-            if any(re.search(regex, sender) for regex in ignore_pr_users):
-                get_logger().info(f"Ignoring PR from user '{sender}' due to 'config.ignore_pr_authors' setting")
-                return False
-
-        # logic to ignore PRs with specific titles
-        if title:
-            ignore_pr_title_re = get_settings().get("CONFIG.IGNORE_PR_TITLE", [])
-            if not isinstance(ignore_pr_title_re, list):
-                ignore_pr_title_re = [ignore_pr_title_re]
-            if ignore_pr_title_re and any(re.search(regex, title) for regex in ignore_pr_title_re):
-                get_logger().info(f"Ignoring PR with title '{title}' due to config.ignore_pr_title setting")
-                return False
-
-        ignore_pr_source_branches = get_settings().get("CONFIG.IGNORE_PR_SOURCE_BRANCHES", [])
-        ignore_pr_target_branches = get_settings().get("CONFIG.IGNORE_PR_TARGET_BRANCHES", [])
-        if (ignore_pr_source_branches or ignore_pr_target_branches):
-            if any(re.search(regex, source_branch) for regex in ignore_pr_source_branches):
-                get_logger().info(
-                    f"Ignoring PR with source branch '{source_branch}' due to config.ignore_pr_source_branches settings")
-                return False
-            if any(re.search(regex, target_branch) for regex in ignore_pr_target_branches):
-                get_logger().info(
-                    f"Ignoring PR with target branch '{target_branch}' due to config.ignore_pr_target_branches settings")
-                return False
-    except Exception as e:
-        get_logger().error(f"Failed 'should_process_pr_logic': {e}")
-    return True
+    return shared_should_process_pr_logic(data, provider="bitbucket_app")
 
 
 @router.post("/webhook")
@@ -279,7 +275,7 @@ async def handle_github_webhooks(background_tasks: BackgroundTasks, request: Req
         return "OK"
     input_jwt = jwt_parts[1]
     data = await request.json()
-    get_logger().debug(data)
+    get_logger().debug(_payload_log_summary(data))
 
     async def inner():
         try:
@@ -366,8 +362,7 @@ async def handle_github_webhooks(background_tasks: BackgroundTasks, request: Req
                     with get_logger().contextualize(**log_context):
                         if get_identity_provider().verify_eligibility("bitbucket",
                                                         sender_id, pr_url) is not Eligibility.NOT_ELIGIBLE:
-                            if get_settings().get("bitbucket_app.pr_commands"):
-                                await _perform_commands_bitbucket("pr_commands", agent, pr_url, log_context, data)
+                            await _perform_commands_bitbucket("pr_commands", agent, pr_url, log_context, data)
             elif event == "pullrequest:updated": # PR updated, might be from a push (we will validate this later)
                 pr_url = data["data"]["pullrequest"]["links"]["html"]["href"]
                 log_context["api_url"] = pr_url
@@ -376,14 +371,15 @@ async def handle_github_webhooks(background_tasks: BackgroundTasks, request: Req
                     with get_logger().contextualize(**log_context):
                         if get_identity_provider().verify_eligibility("bitbucket",
                                                         sender_id, pr_url) is not Eligibility.NOT_ELIGIBLE:
-
-                            if get_settings().get("bitbucket_app.push_commands"):
-                                await _perform_commands_bitbucket("push_commands", agent, pr_url, log_context, data)
+                            await _perform_commands_bitbucket("push_commands", agent, pr_url, log_context, data)
             elif event == "pullrequest:comment_created":
                 pr_url = data["data"]["pullrequest"]["links"]["html"]["href"]
                 log_context["api_url"] = pr_url
                 log_context["event"] = "comment"
                 comment_body = data["data"]["comment"]["content"]["raw"]
+                if not is_command_comment(comment_body):
+                    get_logger().info("Ignoring comment not starting with /")
+                    return
                 with get_logger().contextualize(**log_context):
                     if get_identity_provider().verify_eligibility("bitbucket",
                                                                      sender_id, pr_url) is not Eligibility.NOT_ELIGIBLE:
@@ -394,24 +390,43 @@ async def handle_github_webhooks(background_tasks: BackgroundTasks, request: Req
     return "OK"
 
 @router.get("/webhook")
-async def handle_github_webhooks(request: Request, response: Response):
+async def handle_webhook_health(request: Request, response: Response):
     return "Webhook server online!"
 
 @router.post("/installed")
 async def handle_installed_webhooks(request: Request, response: Response):
+    get_logger().info("handle_installed_webhooks")
     try:
-        get_logger().info("handle_installed_webhooks")
         data = await request.json()
-        shared_secret = data["sharedSecret"]
-        client_key = data["clientKey"]
-        username = data["principal"]["username"]
-        secrets = {
-            "shared_secret": shared_secret,
-            "client_key": client_key
-        }
+    except Exception as e:
+        get_logger().error(f"Failed to register user: invalid JSON payload ({type(e).__name__})")
+        return JSONResponse({"error": "Unable to register user"}, status_code=500)
+
+    if not isinstance(data, dict):
+        get_logger().error("Failed to register user: installation payload must be a JSON object")
+        return JSONResponse({"error": "Unable to register user"}, status_code=500)
+
+    for field in ("sharedSecret", "clientKey", "principal"):
+        if field not in data:
+            get_logger().error(f"Failed to register user: missing required field '{field}'")
+            return JSONResponse({"error": "Unable to register user"}, status_code=500)
+
+    principal = data["principal"]
+    if not isinstance(principal, dict) or "username" not in principal:
+        get_logger().error("Failed to register user: missing or invalid required field 'principal.username'")
+        return JSONResponse({"error": "Unable to register user"}, status_code=500)
+
+    shared_secret = data["sharedSecret"]
+    client_key = data["clientKey"]
+    username = principal["username"]
+    secrets = {
+        "shared_secret": shared_secret,
+        "client_key": client_key
+    }
+    try:
         get_fork_safe_secret_provider().store_secret(username, json.dumps(secrets))
     except Exception as e:
-        get_logger().error(f"Failed to register user: {e}")
+        get_logger().error(f"Failed to register user: secret provider failure ({type(e).__name__})")
         return JSONResponse({"error": "Unable to register user"}, status_code=500)
 
 @router.post("/uninstalled")
@@ -419,7 +434,7 @@ async def handle_uninstalled_webhooks(request: Request, response: Response):
     get_logger().info("handle_uninstalled_webhooks")
 
     data = await request.json()
-    get_logger().info(data)
+    get_logger().info(_payload_log_summary(data))
 
 
 def start():
@@ -427,7 +442,7 @@ def start():
     get_settings().set("CONFIG.GIT_PROVIDER", "bitbucket")
     get_settings().set("PR_DESCRIPTION.PUBLISH_DESCRIPTION_AS_COMMENT", True)
     middleware = [Middleware(RawContextMiddleware)]
-    app = FastAPI(middleware=middleware)
+    app = create_server_app(middleware=middleware)
     app.include_router(router)
 
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "3000")))

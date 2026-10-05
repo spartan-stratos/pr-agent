@@ -1,13 +1,18 @@
+---
+title: "Locally"
+sidebar_position: 3
+---
+
 To run PR-Agent locally, you first need to acquire two keys:
 
 Local execution has two distinct cases: use the hosted-provider examples below for an existing PR/MR URL, or use the [Local Git Provider guide](../usage-guide/local_git_provider.md) for branch comparisons without a hosted PR/MR.
 
-1. An API key for your configured [language model provider](../usage-guide/changing_a_model.md). For OpenAI, create one [here](https://platform.openai.com/api-keys){:target="_blank"}.
-2. A personal access token from your Git platform (GitHub, GitLab, BitBucket, Gitea) with repo scope. GitHub token, for example, can be issued from [here](https://github.com/settings/tokens){:target="_blank"}
+1. An API key for your configured [language model provider](../usage-guide/changing_a_model.md). For OpenAI, create one <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer">here</a>.
+2. A personal access token from your Git platform (GitHub, GitLab, BitBucket, Gitea) with repo scope. GitHub token, for example, can be issued from <a href="https://github.com/settings/tokens" target="_blank" rel="noopener noreferrer">here</a>
 
 ## Using Docker image
 
-A list of the relevant tools can be found in the [tools guide](../tools/).
+A list of the relevant tools can be found in the [tools guide](../tools/index.md).
 
 To invoke a tool (for example `review`), you can run PR-Agent directly from the Docker image. Here's how:
 
@@ -90,15 +95,18 @@ Carefully check the api keys and tokens you provided and make sure they are corr
 Adjustments may be needed depending on your llm provider.
 
 For example, for Azure OpenAI, additional keys are [needed](../usage-guide/changing_a_model.md#azure).
-Same goes for other providers, make sure to check the [documentation](../usage-guide/changing_a_model.md#changing-a-model)
+Same goes for other providers, make sure to check the [documentation](../usage-guide/changing_a_model.md#changing-a-model-in-pr-agent)
 
 ## Using pip package
 
 Install the package:
 
 ```bash
-pip install pr-agent
+pip install "pr-agent[github]"
 ```
+
+Git provider SDKs are optional extras, so install the one for your provider: `github`, `gitlab`, `bitbucket` (Bitbucket Cloud, Bitbucket Server and Jira), `azure`, `codecommit` or `gitea`.
+`google` adds Vertex AI, `mosaico` adds the Mosaico server, and `pr-agent[all]` installs every integration.
 
 Then run the relevant tool with the script below.
 <br>
@@ -122,12 +130,22 @@ def main():
     get_settings().set("github.user_token", user_token)
 
     # Run the command. Feedback will appear in GitHub PR comments
-    cli.run_command(pr_url, command)
+    return cli.run_command(pr_url, command)
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
 ```
+
+With `config.propagate_tool_errors` enabled, forwarding the return value through `SystemExit` makes this script exit with status 1 after a propagated tool error. The default remains status 0.
+
+The Python helper accepts quoted arguments, for example
+`cli.run_command(pr_url, "/review --pr_reviewer.extra_instructions='be concise please'")`.
+It uses the same quoting rules as configured automation commands: explicitly
+quoted setting values stay strings, and unquoted values retain their normal
+types. For questions containing apostrophes, use double quotes around the
+question, such as `command = '/ask "What\'s changed?"'`.
+This does not change how interactive PR comments are parsed.
 
 ## Run from source
 

@@ -77,6 +77,47 @@ same scoping in the wrapper.
 file exists to prevent: an undocumented patch is one a future merge deletes silently. It merged
 cleanly this time by luck, not by review.
 
+## Upstream merge status (2026-10-05, upstream/main @ 515 commits)
+
+Checked at the merge of `upstream/main` into `custom-upstream-2026-10` (515 behind, 55 ahead).
+Only 4 files conflicted; `pr_code_suggestions.py`, `algo/__init__.py`,
+`pr_code_suggestions_reflect_prompts.toml` and `tests/unittest/test_local_git_provider.py` all
+auto-merged.
+
+| # | Patch | Status after merge |
+|---|---|---|
+| 1 | stdout-sink dropped-suggestion recovery | Still applies. `scripts/` only, untouched. |
+| 2 | out-of-hunk inline-comment drop handling | Still applies. |
+| 3 | SIGPIPE-under-`pipefail` truncation fix | Still applies. `scripts/` only. |
+| 4 | 404-as-fake-conventions guard | Still applies. `scripts/` only. |
+| 5 | worktree `.git`-file repo-root detection | **Superseded upstream** (again). Upstream now writes `(cwd / ".git").exists()`, which covers both cases. Took upstream; the fork no longer carries the explicit `is_dir() or is_file()` branch. |
+| 6 | scoped clean-tree check | Still applies, byte-identical through the merge. Verified against `custom`. |
+
+Conflict resolutions:
+
+- `pr_agent/agent/pr_agent.py` - kept FORK: `PRAgent.__init__` defaults to `get_ai_handler()`
+  (claude_cli routing) rather than upstream's `LiteLLMAIHandler` literal default.
+- `pr_agent/config_loader.py` - took UPSTREAM (patch 5, see above).
+- `pr_agent/git_providers/local_git_provider.py` - import-only conflict; kept BOTH
+  (`filter_ignored` from the fork, `format_pr_code_suggestions_header` from upstream). Ruff
+  re-sorted the block.
+- `pr_agent/settings/configuration.toml` - kept FORK on one comment line: upstream reintroduced an
+  em-dash, the fork uses a plain hyphen.
+
+New upstream additions this fork now inherits:
+
+- `scripts/check_docs_urls.py` and `scripts/generate_config_reference.py` are upstream files that
+  landed in the otherwise fork-only `scripts/` tree. No fork script was modified.
+- `docs/` moved from MkDocs to Docusaurus; `AGENTS.md` came through from upstream describing it.
+- `requirements*.txt` stay deleted; deps live in `pyproject.toml`, which now pins
+  `required-version = "==0.12.10"` for uv. A stale uv refuses every `uv run`, so the merge forces a
+  `uv self update 0.12.10` on each machine.
+- `tests/unittest/test_config_reference.py` asserts an exact configuration key count. Upstream's
+  278 became 282 here, because the fork's `[claude_cli]` section adds `command`,
+  `disallowed_tools`, `extra_args` and `timeout`. The constant was bumped and
+  `docs/docs/usage-guide/configuration_reference.md` regenerated. **This is a recurring merge cost:
+  every future upstream bump to that number conflicts with the fork's +4.**
+
 ## Migration trigger (pre-committed)
 
 The **next** bug that requires editing `pr_agent/config_loader.py` or

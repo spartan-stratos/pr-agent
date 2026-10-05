@@ -158,7 +158,12 @@ code_suggestions:
 
 We can further improve the code by using the `const` keyword instead of `var` in the `src/index.ts` file.
 '''
-        expected_output = {'code_suggestions': [{'relevant_file': 'src/index.ts\n', 'label': 'best practice\n'}, {'relevant_file': 'src/index2.ts\n', 'label': 'enhancement'}]}
+        expected_output = {
+            "code_suggestions": [
+                {"relevant_file": "src/index.ts\n", "label": "best practice\n"},
+                {"relevant_file": "src/index2.ts\n", "label": "enhancement"},
+            ]
+        }
 
         assert try_fix_yaml(review_text, first_key='code_suggestions', last_key='label') == expected_output
 
@@ -181,7 +186,12 @@ code_suggestions:
 
 We can further improve the code by using the `const` keyword instead of `var` in the `src/index.ts` file.
 '''
-        expected_output = {'code_suggestions': [{'relevant_file': 'src/index.ts\n', 'label': 'best practice\n'}, {'relevant_file': 'src/index2.ts\n', 'label': 'enhancement'}]}
+        expected_output = {
+            "code_suggestions": [
+                {"relevant_file": "src/index.ts\n", "label": "best practice\n"},
+                {"relevant_file": "src/index2.ts\n", "label": "enhancement"},
+            ]
+        }
         assert try_fix_yaml(review_text, first_key='code_suggestions', last_key='label') == expected_output
 
 
@@ -200,7 +210,12 @@ code_suggestions:
     enhancement
 }
 '''
-        expected_output = {'code_suggestions': [{'relevant_file': 'src/index.ts\n', 'label': 'best practice\n'}, {'relevant_file': 'src/index2.ts\n', 'label': 'enhancement'}]}
+        expected_output = {
+            "code_suggestions": [
+                {"relevant_file": "src/index.ts\n", "label": "best practice\n"},
+                {"relevant_file": "src/index2.ts\n", "label": "enhancement"},
+            ]
+        }
         assert try_fix_yaml(review_text, first_key='code_suggestions', last_key='label') == expected_output
 
     def test_tab_indent_yaml(self):
@@ -216,7 +231,12 @@ code_suggestions:
   label: |
     enhancement
 '''
-        expected_output = {'code_suggestions': [{'relevant_file': 'src/index.ts\n', 'label': 'best practice\n'}, {'relevant_file': 'src/index2.ts\n', 'label': 'enhancement\n'}]}
+        expected_output = {
+            "code_suggestions": [
+                {"relevant_file": "src/index.ts\n", "label": "best practice\n"},
+                {"relevant_file": "src/index2.ts\n", "label": "enhancement\n"},
+            ]
+        }
         assert try_fix_yaml(review_text, first_key='code_suggestions', last_key='label') == expected_output
 
 
@@ -318,6 +338,83 @@ code_suggestions:
         }
         assert try_fix_yaml(review_text, first_key='code_suggestions', last_key='existing_code') == expected_output
 
+    def test_stray_closing_brace_is_not_added_to_block_scalar(self):
+        review_text = '''\
+code_suggestions:
+- relevant_file: |
+    example.py
+  improved_code: |
+    return shared_helper(x)
+  }
+'''
+        expected_output = {
+            'code_suggestions': [{
+                'relevant_file': 'example.py\n',
+                'improved_code': 'return shared_helper(x)\n'
+            }]
+        }
+
+        assert try_fix_yaml(review_text, first_key='code_suggestions', last_key='improved_code') == expected_output
+
+    def test_stray_closing_brace_before_following_key_is_not_added_to_block_scalar(self):
+        review_text = '''\
+code_suggestions:
+- relevant_file: |
+    example.py
+  improved_code: |
+    return shared_helper(x)
+  }
+  label: |
+    maintainability
+'''
+        expected_output = {
+            'code_suggestions': [{
+                'relevant_file': 'example.py\n',
+                'improved_code': 'return shared_helper(x)\n',
+                'label': 'maintainability\n'
+            }]
+        }
+
+        assert try_fix_yaml(review_text, first_key='code_suggestions', last_key='improved_code') == expected_output
+
+    def test_closing_brace_after_brace_in_string_stays_in_block_scalar(self):
+        review_text = '''\
+code_suggestions:
+- relevant_file: |
+    example.js
+  existing_code: |
+    if (x) {
+      console.log("}");
+  }
+'''
+        expected_output = {
+            'code_suggestions': [{
+                'relevant_file': 'example.js\n',
+                'existing_code': 'if (x) {\n  console.log("}");\n}\n'
+            }]
+        }
+
+        assert try_fix_yaml(review_text, first_key='code_suggestions', last_key='existing_code') == expected_output
+
+    def test_closing_brace_after_else_block_stays_in_block_scalar(self):
+        review_text = '''\
+code_suggestions:
+- relevant_file: |
+    example.js
+  existing_code: |
+    } else {
+      fallback()
+  }
+'''
+        expected_output = {
+            'code_suggestions': [{
+                'relevant_file': 'example.js\n',
+                'existing_code': '} else {\n  fallback()\n}\n'
+            }]
+        }
+
+        assert try_fix_yaml(review_text, first_key='code_suggestions', last_key='existing_code') == expected_output
+
 
     def test_wrong_indentation_code_block_scalar(self):
         review_text = '''\
@@ -333,21 +430,20 @@ code_suggestions:
     return a - b;
   }
 '''
-        expected_code_block = '''\
-int sum(int a, int b) {
-  return a + b;
-}
-
-int sub(int a, int b) {
-  return a - b;
-}
-'''
-        expected_output = {'code_suggestions': [{'relevant_file': 'a.c\n', 'existing_code': '  int sum(int a, int b) {\n    return a + b;\n  }\n\n  int sub(int a, int b) {\n    return a - b;\n  }\n'}]}
+        expected_output = {
+            "code_suggestions": [{
+                "relevant_file": "a.c\n",
+                "existing_code": (
+                    "  int sum(int a, int b) {\n    return a + b;\n  }\n\n"
+                    "  int sub(int a, int b) {\n    return a - b;\n  }\n"
+                ),
+            }]
+        }
         assert try_fix_yaml(review_text, first_key='code_suggestions', last_key='existing_code') == expected_output
 
     def test_diff_markers_removed_within_list_item(self):
         """
-            Ensures diff-style '-' markers nested inside list items are normalised so the YAML parses
+            Ensures diff-style '-' markers nested inside list items are normalized so the YAML parses
             into the expected structure.
         """
         review_text = '''\

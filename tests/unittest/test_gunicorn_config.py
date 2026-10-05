@@ -1,3 +1,8 @@
+import runpy
+import sys
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 
 from pr_agent.servers import gunicorn_config
@@ -8,6 +13,7 @@ def isolated_env(monkeypatch, tmp_path):
     """Detach every test from the host's env vars, CPU affinity, and real cgroup files."""
     monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
     monkeypatch.delenv("GUNICORN_MAX_WORKERS", raising=False)
+    monkeypatch.delenv("PORT", raising=False)
     monkeypatch.setattr(gunicorn_config.os, "sched_getaffinity", lambda pid: set(range(64)), raising=False)
     for attr in ("CGROUP_V2_CPU_MAX", "CGROUP_V1_CPU_QUOTA", "CGROUP_V1_CPU_PERIOD"):
         monkeypatch.setattr(gunicorn_config, attr, str(tmp_path / "missing"))
@@ -85,6 +91,13 @@ class TestAvailableCpus:
         monkeypatch.delattr(gunicorn_config.os, "sched_getaffinity", raising=False)
         monkeypatch.setattr(gunicorn_config.os, "cpu_count", lambda: None)
         assert gunicorn_config.available_cpus() == 1
+
+
+@pytest.mark.parametrize("port,expected", [(None, "3000"), ("", "3000"), ("8080", "8080")])
+def test_bind_uses_port_or_default(monkeypatch, port, expected):
+    if port is not None:
+        monkeypatch.setenv("PORT", port)
+    assert runpy.run_path(gunicorn_config.__file__)["bind"] == f"0.0.0.0:{expected}"
 
 
 class TestComputeWorkers:
@@ -174,3 +187,38 @@ def test_when_ready_freezes_gc(monkeypatch):
     monkeypatch.setattr(gunicorn_config.gc, "freeze", lambda: calls.append(True))
     gunicorn_config.when_ready(server=None)
     assert calls == [True]
+
+
+def _fake_prometheus_client(monkeypatch):
+    """Stub prometheus_client so the gate tests never import the real module.
+
+    Importing the real module would let it read PROMETHEUS_MULTIPROC_DIR and
+    permanently decide the process-wide storage mode, which collides with the
+    telemetry suite's import-time decision. A fake module keeps the test
+    isolated and still exercises child_exit's own import plus the gate.
+    """
+    multiproc_module = ModuleType("prometheus_client.multiprocess")
+    multiproc_module.mark_process_dead = Mock()
+    client_module = ModuleType("prometheus_client")
+    client_module.multiprocess = multiproc_module
+    monkeypatch.setitem(sys.modules, "prometheus_client", client_module)
+    monkeypatch.setitem(sys.modules, "prometheus_client.multiprocess", multiproc_module)
+    return multiproc_module
+
+
+def test_child_exit_skips_prometheus_without_multiproc_dir(monkeypatch):
+    fake_multiprocess = _fake_prometheus_client(monkeypatch)
+    monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
+
+    gunicorn_config.child_exit(server=None, worker=SimpleNamespace(pid=123))
+
+    fake_multiprocess.mark_process_dead.assert_not_called()
+
+
+def test_child_exit_marks_worker_dead_when_multiproc_dir_set(monkeypatch, tmp_path):
+    fake_multiprocess = _fake_prometheus_client(monkeypatch)
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+
+    gunicorn_config.child_exit(server=None, worker=SimpleNamespace(pid=456))
+
+    fake_multiprocess.mark_process_dead.assert_called_once_with(456)

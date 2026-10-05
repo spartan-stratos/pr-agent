@@ -1,9 +1,8 @@
 import gc
 import os
 
-# from prometheus_client import multiprocess
-
 # Sample Gunicorn configuration file.
+
 
 #
 # Server socket
@@ -23,8 +22,9 @@ import os
 #       range.
 #
 
+
 # bind = '0.0.0.0:5000'
-bind = '0.0.0.0:3000'
+bind = f"0.0.0.0:{os.getenv('PORT') or 3000}"
 backlog = 2048
 
 #
@@ -280,6 +280,37 @@ def when_ready(server):
     # object it visits. Freezing moves everything allocated so far into a permanent
     # generation the collector never traverses, keeping those pages shared.
     gc.freeze()
+    _prepare_prometheus()
+
+
+def _prepare_prometheus():
+    """Provision the multiprocess state dir before any worker imports prometheus_client.
+
+    prometheus_client decides at import time whether metrics are multiprocess-capable,
+    so the dir must exist (and PROMETHEUS_MULTIPROC_DIR be set) in the master before the
+    first worker fork — workers import the client lazily and inherit the env var.
+    """
+    from pr_agent.config_loader import get_settings
+    from pr_agent.telemetry.prometheus_multiproc import ensure_prometheus_multiproc_dir
+    from pr_agent.telemetry.types import ExporterType
+
+    settings = get_settings()
+    if settings.get("OTEL.IS_ENABLED", False) and settings.get("OTEL.EXPORTER_TYPE") == ExporterType.PROMETHEUS:
+        ensure_prometheus_multiproc_dir(str(settings.get("OTEL.PROMETHEUS_MULTIPROC_DIR", "/tmp/pr-agent-prometheus")))
+
+
+def child_exit(server, worker):
+    """Called in the master when a worker exits; drop the worker's stale state files."""
+    from pr_agent.telemetry.prometheus_multiproc import prometheus_multiproc_dir
+
+    if not prometheus_multiproc_dir():
+        return
+    # Imported lazily: the master only ever sees prometheus_client at exit time, never
+    # while importing the app under preload_app (which would break multiprocess mode in
+    # the forked workers).
+    from prometheus_client import multiprocess
+
+    multiprocess.mark_process_dead(worker.pid)
 
 
 def post_fork(server, worker):
@@ -287,7 +318,7 @@ def post_fork(server, worker):
     # The webhook apps call setup_logger() at import, which under `preload_app` now runs
     # in the master. When CONFIG.ANALYTICS_FOLDER is set that opens `pr-agent.<pid>.log`
     # named for the *master*, and every worker inherits the same descriptor. Re-running it
-    # here gives each worker its own file again. All three apps that use this config call
+    # here gives each worker its own file again. All four apps that use this config call
     # setup_logger identically, so repeating that call is enough.
     from pr_agent.config_loader import get_settings
     from pr_agent.log import LoggingFormat, setup_logger

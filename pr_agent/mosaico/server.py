@@ -56,7 +56,7 @@ def _configure_runtime() -> None:
     The JSON logger is configured in start() instead (real runtime), where the config is
     already loaded. build_app() does not depend on the JSON sink."""
     apply_mosaico_env()
-    # Idempotent registry insert (_GIT_PROVIDERS.setdefault("mosaico_diff", ...)).
+    # Idempotent registration (register_git_provider("mosaico_diff", ...)).
     import pr_agent.mosaico.provider_registration  # noqa: F401
     _configure_langfuse()
 
@@ -78,9 +78,10 @@ def build_app():
     """Build the Starlette app: A2A card + JSONRPC routes + /health, with
     RawContextMiddleware on the same app (A2A 1.0)."""
     card = build_agent_card()
+    task_store = InMemoryTaskStore()
     handler = DefaultRequestHandler(
-        agent_executor=PRAgentExecutor(),
-        task_store=InMemoryTaskStore(),
+        agent_executor=PRAgentExecutor(task_store=task_store),
+        task_store=task_store,
         agent_card=card,
     )
     routes = [

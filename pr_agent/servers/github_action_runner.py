@@ -1,22 +1,42 @@
 import asyncio
 import json
 import os
-from typing import Union
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Optional, Union
 
-from pr_agent.agent.pr_agent import PRAgent
+import dynaconf
+
+from pr_agent.agent.pr_agent import PRAgent, parse_command, publish_incomplete_files_comment
 from pr_agent.algo.ai_handlers.litellm_helpers import (
     DEFAULT_CALLBACK_TIMEOUT_SECONDS,
     drain_litellm_callbacks,
     litellm_callbacks_registered,
 )
+from pr_agent.algo.artifacts import inject_artifact_context as _inject_artifact_context
+from pr_agent.algo.run_details import command_failed, init_run_details
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import get_git_provider
+from pr_agent.git_providers.github_provider import IncompletePullRequestFilesError
 from pr_agent.git_providers.utils import apply_repo_settings
-from pr_agent.log import get_logger
-from pr_agent.servers.github_app import handle_line_comments
+from pr_agent.log import get_logger, setup_logger
+from pr_agent.servers.github_common import (
+    _reformat_quote_ask_command,
+    handle_line_comments,
+    matches_review_state,
+)
+from pr_agent.servers.utils import is_ask_command_comment
 from pr_agent.tools.pr_code_suggestions import PRCodeSuggestions
 from pr_agent.tools.pr_description import PRDescription
 from pr_agent.tools.pr_reviewer import PRReviewer
+
+
+@dataclass
+class _ActionStatus:
+    failed: bool = False
+
+
+_action_status: ContextVar[Optional[_ActionStatus]] = ContextVar("pr_agent_action_status", default=None)
 
 
 def is_true(value: Union[str, bool]) -> bool:
@@ -35,51 +55,148 @@ def get_setting_or_env(key: str, default: Union[str, bool] = None) -> Union[str,
     return value
 
 
-def _inject_artifact_context():
-    """Inject CI artifact content into extra_instructions for configured tools."""
-    artifact_path_env = (
-        os.environ.get("ARTIFACT_PATH") or os.environ.get("PR_AGENT_ARTIFACT_PATH") or ""
-    ).strip()
-    artifact_instructions_env = (
-        os.environ.get("ARTIFACT_INSTRUCTIONS") or os.environ.get("PR_AGENT_ARTIFACT_INSTRUCTIONS") or ""
-    ).strip()
-    if artifact_path_env:
-        get_settings().set("ARTIFACTS.ENABLE", True)
-        get_settings().set("ARTIFACTS.ARTIFACT_PATH", artifact_path_env)
-        if artifact_instructions_env:
-            get_settings().set("ARTIFACTS.ARTIFACT_INSTRUCTIONS", artifact_instructions_env)
+def get_list_setting_or_env(key, fallback=None):
+    value = get_setting_or_env(key, None)
+    if value is None:
+        value = fallback
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return []
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return [value]
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
 
-    artifacts_enabled = get_settings().get("ARTIFACTS.ENABLE", False)
-    if not is_true(artifacts_enabled):
+
+async def _handle_request(url, body, notify=None):
+    # Install a fresh collector so `command_failed()` below cannot read a verdict left
+    # behind by a previous command; the tool replaces it with its own on entry.
+    init_run_details()
+    result = await PRAgent().handle_request(url, body, notify=notify)
+    if result is False:
+        _mark_action_failed()
+    _fail_on_recorded_tool_error()
+
+
+async def _handle_configured_command(url, command):
+    try:
+        command_args = parse_command(command) if isinstance(command, str) else command
+        if not command_args:
+            raise ValueError("Empty configured command")
+    except ValueError:
+        get_logger().error("Failed to parse a configured command; skipping it.")
+        _mark_action_failed()
+        return
+    await _handle_request(url, command_args)
+
+
+def _mark_action_failed():
+    status = _action_status.get()
+    if status is not None:
+        status.failed = True
+
+
+def _fail_on_recorded_tool_error():
+    # Fail the Action on a failure the tool recorded but swallowed (propagate_tool_errors=false),
+    # so a PR that got no review is not reported green (#3705). The operator opts out with
+    # GITHUB_ACTION_CONFIG.FAIL_ON_TOOL_ERRORS=false; comment arguments cannot change it.
+    if not is_true(get_setting_or_env("GITHUB_ACTION_CONFIG.FAIL_ON_TOOL_ERRORS", True)):
+        return
+    if command_failed():
+        get_logger().warning("Tool reported success but recorded a failure; failing the action")
+        _mark_action_failed()
+
+
+async def _run_auto_tool(tool_class, pr_url):
+    """Run a direct auto tool while preserving GitHub Action failure semantics."""
+    # Install a fresh collector so `command_failed()` below cannot read a verdict left
+    # behind by a previous tool; the tool replaces it with its own on entry.
+    init_run_details()
+    try:
+        result = await tool_class(pr_url).run()
+    except IncompletePullRequestFilesError as error:
+        await asyncio.to_thread(publish_incomplete_files_comment, pr_url, error)
+        raise
+    if result is False:
+        _mark_action_failed()
+    _fail_on_recorded_tool_error()
+
+async def _run_review_commands(event_payload):
+    action = event_payload.get("action")
+    if action != "submitted":
+        get_logger().info(f"Skipping pull_request_review action: {action}")
+        return
+    if event_payload.get("sender", {}).get("type") == "Bot":
+        get_logger().info("Skipping pull_request_review event from a bot sender")
         return
 
-    try:
-        from pr_agent.algo.artifacts import load_artifact
+    pull_request = event_payload.get("pull_request", {})
+    pr_url = pull_request.get("url")
+    if not pr_url:
+        get_logger().info("Skipping pull_request_review: pull_request.url is missing")
+        return
 
-        artifact_text = load_artifact()
-        if not artifact_text:
-            return
-        target_tools = get_settings().get(
-            "ARTIFACTS.TARGET_TOOLS",
-            ["pr_reviewer", "pr_description", "pr_code_suggestions"]
+    review = event_payload.get("review", {})
+    review_state = review.get("state", "") if isinstance(review, dict) else ""
+    review_author_type = ""
+    if isinstance(review, dict):
+        review_author = review.get("user", {})
+        if isinstance(review_author, dict):
+            review_author_type = str(review_author.get("type", "")).strip().lower()
+    review_author_types = get_list_setting_or_env(
+        "GITHUB_ACTION_CONFIG.REVIEW_AUTHOR_TYPES",
+        get_settings().get("GITHUB_APP.REVIEW_AUTHOR_TYPES", ["User"]),
+    )
+    review_author_types = {
+        str(author_type).strip().lower() for author_type in review_author_types if str(author_type).strip()
+    }
+    if review_author_type not in review_author_types:
+        get_logger().info(
+            f"Skipping pull_request_review from {review_author_type=}: author type is not configured"
         )
-        if isinstance(target_tools, str):
-            target_tools = [t.strip() for t in target_tools.split(",") if t.strip()]
-        target_tools = {str(t).lower() for t in target_tools}
-        separator = "\n======\n\n"
-        for key in get_settings():
-            setting = get_settings().get(key)
-            if str(type(setting)) == "<class 'dynaconf.utils.boxing.DynaBox'>":
-                if key.lower() in target_tools and hasattr(setting, 'extra_instructions'):
-                    extra_instructions = str(setting.extra_instructions or "")
-                    if artifact_text not in extra_instructions:
-                        setting.extra_instructions = (
-                            extra_instructions + separator + artifact_text
-                            if extra_instructions else artifact_text
-                        )
-        get_logger().info(f"Injected artifact context into tools: {target_tools}")
-    except (OSError, ValueError, TypeError) as e:
-        get_logger().warning(f"github action: failed to process artifacts: {e}", exc_info=True)
+        return
+    review_states = get_list_setting_or_env(
+        "GITHUB_ACTION_CONFIG.REVIEW_STATES",
+        get_settings().get("GITHUB_APP.REVIEW_STATES", ["changes_requested"]),
+    )
+    if not matches_review_state(review_state, review_states):
+        get_logger().info(f"Skipping pull_request_review with {review_state=}: state is not configured")
+        return
+
+    review_commands = get_list_setting_or_env(
+        "GITHUB_ACTION_CONFIG.REVIEW_COMMANDS",
+        get_settings().get("GITHUB_APP.REVIEW_COMMANDS", []),
+    )
+    if not review_commands:
+        get_logger().info("No review_commands configured, skipping pull_request_review")
+        return
+
+    feedback_on_draft = get_setting_or_env("GITHUB_ACTION_CONFIG.FEEDBACK_ON_DRAFT_PR", None)
+    if feedback_on_draft is None:
+        feedback_on_draft = get_settings().get("GITHUB_APP.FEEDBACK_ON_DRAFT_PR", False)
+    if pull_request.get("draft", True) and not is_true(feedback_on_draft):
+        get_logger().info(f"Skipping draft PR for pull_request_review: {pr_url=}")
+        return
+
+    disable_auto_feedback = get_setting_or_env("CONFIG.DISABLE_AUTO_FEEDBACK", None)
+    if disable_auto_feedback is None:
+        disable_auto_feedback = get_settings().get("CONFIG.DISABLE_AUTO_FEEDBACK", False)
+    if is_true(disable_auto_feedback):
+        get_logger().info(f"Auto feedback is disabled, skipping pull_request_review: {pr_url=}")
+        return
+
+    _inject_artifact_context()
+    get_settings().config.is_auto_command = True
+    get_settings().pr_description.final_update_message = False
+    get_logger().info(f"Running review commands: {review_commands}")
+    for command in review_commands:
+        await _handle_configured_command(pr_url, command)
 
 
 async def run_action():
@@ -140,12 +257,16 @@ async def run_action():
         if response_language.lower() != 'en-us':
             get_logger().info(f'User has set the response language to: {response_language}')
 
-            lang_instruction_text = f"Your response MUST be written in the language corresponding to locale code: '{response_language}'. This is crucial."
+            lang_instruction_text = (
+                f"Your response MUST be written in the language corresponding to locale code: "
+                f"'{response_language}'. This is crucial. Keep schema control values "
+                f"(such as 'No', 'Yes', 'None', 'false') in their original English form "
+                f"and do not translate them.")
             separator_text = "\n======\n\nIn addition, "
 
             for key in get_settings():
                 setting = get_settings().get(key)
-                if str(type(setting)) == "<class 'dynaconf.utils.boxing.DynaBox'>":
+                if isinstance(setting, dynaconf.DataDict):
                     if key.lower() in ['pr_description', 'pr_code_suggestions', 'pr_reviewer']:
                         if hasattr(setting, 'extra_instructions'):
                             extra_instructions = setting.extra_instructions
@@ -166,7 +287,8 @@ async def run_action():
         action = event_payload.get("action")
 
         # Retrieve the list of actions from the configuration
-        pr_actions = get_settings().get("GITHUB_ACTION_CONFIG.PR_ACTIONS", ["opened", "reopened", "ready_for_review", "review_requested"])
+        pr_actions = get_settings().get(
+            "GITHUB_ACTION_CONFIG.PR_ACTIONS", ["opened", "reopened", "ready_for_review", "review_requested"])
 
         # Handle synchronize first so it is not captured by pr_actions
         if action == "synchronize":
@@ -212,7 +334,7 @@ async def run_action():
                 get_settings().pr_description.final_update_message = False
                 get_logger().info(f"Running push commands: {push_commands}")
                 for command in push_commands:
-                    await PRAgent().handle_request(pr_url, command)
+                    await _handle_configured_command(pr_url, command)
                 return
         if action in pr_actions:
             pr_url = event_payload.get("pull_request", {}).get("url")
@@ -230,18 +352,25 @@ async def run_action():
 
                 # Set the configuration for auto actions
                 get_settings().config.is_auto_command = True  # Set the flag to indicate that the command is auto
-                get_settings().pr_description.final_update_message = False  # No final update message when auto_describe is enabled
-                get_logger().info(f"Running auto actions: auto_describe={auto_describe}, auto_review={auto_review}, auto_improve={auto_improve}")
+                # No final update message when auto_describe is enabled
+                get_settings().pr_description.final_update_message = False
+                get_logger().info(
+                    f"Running auto actions: "
+                    f"auto_describe={auto_describe}, auto_review={auto_review}, auto_improve={auto_improve}")
 
                 # invoke by default all three tools
                 if auto_describe is None or is_true(auto_describe):
-                    await PRDescription(pr_url).run()
+                    await _run_auto_tool(PRDescription, pr_url)
                 if auto_review is None or is_true(auto_review):
-                    await PRReviewer(pr_url).run()
+                    await _run_auto_tool(PRReviewer, pr_url)
                 if auto_improve is None or is_true(auto_improve):
-                    await PRCodeSuggestions(pr_url).run()
+                    await _run_auto_tool(PRCodeSuggestions, pr_url)
         else:
             get_logger().info(f"Skipping action: {action}")
+
+    # Handle submitted pull request review event
+    elif GITHUB_EVENT_NAME == "pull_request_review":
+        return await _run_review_commands(event_payload)
 
     # Handle issue comment event
     elif GITHUB_EVENT_NAME == "issue_comment" or GITHUB_EVENT_NAME == "pull_request_review_comment":
@@ -256,9 +385,20 @@ async def run_action():
                 get_logger().info("Skipping comment event from a bot sender to avoid a feedback loop")
                 return
             comment_body = event_payload.get("comment", {}).get("body")
+            # Skip comments that are not commands, mirroring the webhook guard
+            # in github_app.py. Otherwise a plain comment is lexed as an unknown
+            # command, PRAgent.handle_request returns False and the action exits 1.
+            if comment_body and isinstance(comment_body, str) and not comment_body.lstrip().startswith("/"):
+                reformatted = _reformat_quote_ask_command(comment_body) if '/ask' in comment_body else None
+                if reformatted is not None:
+                    comment_body = reformatted
+                    get_logger().info(f"Reformatting comment_body so command is at the beginning: {comment_body}")
+                else:
+                    get_logger().info("Ignoring comment not starting with /")
+                    return
             try:
                 if GITHUB_EVENT_NAME == "pull_request_review_comment":
-                    if '/ask' in comment_body:
+                    if is_ask_command_comment(comment_body):
                         comment_body = handle_line_comments(event_payload, comment_body)
             except Exception as e:
                 get_logger().error(f"Failed to handle line comments: {e}")
@@ -279,8 +419,8 @@ async def run_action():
 
                 if url:
                     # handle_line_comments returns an argv list for /ask line
-                    # comments to bypass shell-style tokenisation; otherwise it
-                    # returns the raw comment string. Only normalise when the
+                    # comments to bypass shell-style tokenization; otherwise it
+                    # returns the raw comment string. Only normalize when the
                     # payload is a string, otherwise the argv list would be
                     # passed through .strip().lower() and raise AttributeError.
                     if isinstance(comment_body, str):
@@ -291,13 +431,15 @@ async def run_action():
                     provider = get_git_provider()(pr_url=url)
                     if is_pr:
                         _inject_artifact_context()
-                        await PRAgent().handle_request(
-                            url, body, notify=lambda: provider.add_eyes_reaction(
+                        await _handle_request(
+                            url,
+                            body,
+                            notify=lambda: provider.add_eyes_reaction(
                                 comment_id, disable_eyes=disable_eyes
-                            )
+                            ),
                         )
                     else:
-                        await PRAgent().handle_request(url, body)
+                        await _handle_request(url, body)
 
     # Handle workflow_run event (triggered after another workflow completes, e.g. after a terraform plan)
     elif GITHUB_EVENT_NAME == "workflow_run":
@@ -346,11 +488,11 @@ async def run_action():
         )
 
         if auto_describe is None or is_true(auto_describe):
-            await PRDescription(pr_url).run()
+            await _run_auto_tool(PRDescription, pr_url)
         if auto_review is None or is_true(auto_review):
-            await PRReviewer(pr_url).run()
+            await _run_auto_tool(PRReviewer, pr_url)
         if auto_improve is None or is_true(auto_improve):
-            await PRCodeSuggestions(pr_url).run()
+            await _run_auto_tool(PRCodeSuggestions, pr_url)
 
 
 def _inject_ci_conclusion(conclusion):
@@ -381,7 +523,7 @@ def _inject_ci_conclusion(conclusion):
     target_tools = {str(t).lower() for t in target_tools}
     for key in get_settings():
         setting = get_settings().get(key)
-        if str(type(setting)) == "<class 'dynaconf.utils.boxing.DynaBox'>":
+        if isinstance(setting, dynaconf.DataDict):
             if key.lower() in target_tools:
                 if hasattr(setting, "extra_instructions"):
                     extra_instructions = str(setting.extra_instructions or "")
@@ -399,14 +541,33 @@ async def _run_action_and_drain():
     Wrapping here rather than at the end of run_action() covers its many early
     returns too, and keeps run_action() itself free of teardown concerns.
     """
+    status = _ActionStatus()
+    token = _action_status.set(status)
+
     try:
-        return await run_action()
+        await run_action()
     finally:
-        if litellm_callbacks_registered():
-            await drain_litellm_callbacks(
-                get_settings().litellm.get("callback_timeout_seconds", DEFAULT_CALLBACK_TIMEOUT_SECONDS)
-            )
+        try:
+            if litellm_callbacks_registered():
+                await drain_litellm_callbacks(
+                    get_settings().litellm.get(
+                        "callback_timeout_seconds",
+                        DEFAULT_CALLBACK_TIMEOUT_SECONDS,
+                    )
+                )
+        finally:
+            _action_status.reset(token)
+
+    if status.failed:
+        raise SystemExit(1)
+
+
+def main():
+    # github_app is no longer imported here, so its JSON logging setup does not
+    # run; configure logging explicitly so the level and analytics filter work.
+    setup_logger(level=get_settings().get("CONFIG.LOG_LEVEL", "DEBUG"))
+    asyncio.run(_run_action_and_drain())
 
 
 if __name__ == '__main__':
-    asyncio.run(_run_action_and_drain())
+    main()

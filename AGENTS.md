@@ -22,7 +22,7 @@ PR-Agent automates AI-assisted reviews for pull requests across multiple git pro
 - `pr_agent/settings/` stores Dynaconf defaults (prompts, configuration templates, ignore lists) respected at runtime; `.pr_agent.toml` overrides repository-level behavior.
 - `pr_agent/servers/` contains webhook and service entrypoints.
 - `tests/unittest/`, `tests/e2e_tests/`, and `tests/health_test/` contain pytest-based unit, end-to-end, and smoke checks.
-- `docs/` holds the MkDocs site (`docs/mkdocs.yml` plus content under `docs/docs/`); overrides live in `docs/overrides/`.
+- `docs/` holds the Docusaurus site (`docs/docusaurus.config.js` and `docs/sidebars.js` plus content under `docs/docs/`); theme overrides live in `docs/src/` and static assets in `docs/static/`.
 - `.github/workflows/` defines CI pipelines for unit tests, coverage, docs deployment, pre-commit, and PR-agent self-review.
 - `docker/` and the root Dockerfiles provide build targets for services (`github_app`, `gitlab_webhook`, etc.) and the `test` stage used in CI.
 
@@ -67,21 +67,21 @@ Sensitive values should stay in environment variables or the gitignored `.secret
 - Run the full unit suite: `PYTHONPATH=. uv run pytest tests/unittest -v`.
 - Execute the CLI locally once dependencies and API keys are available: `uv run pr-agent --pr_url <https://host/org/repo/pull/123> review`.
 - Build the test Docker target mirror of CI when containerizing: `docker build -f docker/Dockerfile --target test .` (loads dev dependencies and copies `tests/`).
-- Generate and deploy documentation with MkDocs after installing the same extras as CI (`mkdocs-material`, `mkdocs-glightbox`): `mkdocs serve -f docs/mkdocs.yml` for previews and `mkdocs gh-deploy -f docs/mkdocs.yml` for publication.
+- Build the documentation the same way CI does (Node.js 22): `npm ci` then `npm run build` from `docs/`; `npm start` serves a live preview. The `docs-ci` workflow publishes `docs/build` to GitHub Pages.
 
 ## Coding Style and Existing Tooling
 
 Ruff is the single linting tool: `pyproject.toml` configures it and the pre-commit Ruff hook enforces it (Flake8 and the standalone isort hook have been removed).
 
 - Keep Python lines within the 120-character limit declared in `pyproject.toml`.
-- `pyproject.toml` configures Ruff rules `E`, `F`, `B`, `I001`, and `I002`; `I001` (import sorting), `F401` (unused imports), and `F541` (f-strings without placeholders) are fixable. The `lint.ignore` list defers pre-existing violations — treat it as a debt ledger: fix the code and drop entries rather than adding new ones.
+- `pyproject.toml` configures Ruff rules `E`, `F`, `B` and `I`; `I001` (import sorting), `F401` (unused imports), and `F541` (f-strings without placeholders) are fixable. The `lint.ignore` list defers pre-existing violations — treat it as a debt ledger: fix the code and drop entries rather than adding new ones.
 - Before committing, run `uv run ruff check --fix` on the files you touched and fix every issue it reports. Keep fixes mechanical (rename, remove unused imports, sort imports); do not alter program logic while cleaning up — if a lint fix would change behavior, surface it instead of applying it silently.
-- `.pre-commit-config.yaml` is the source of truth for enabled pre-commit hooks. Run them on the files you touched with `uv run pre-commit run --files <paths>` and review the automatic edits so unrelated changes are not included. The pre-commit GitHub Actions workflow is manual-only (`workflow_dispatch`); the hooks are not enforced in CI.
+- `.pre-commit-config.yaml` is the source of truth for enabled pre-commit hooks. Run them on the files you touched with `uv run pre-commit run --files <paths>` and review the automatic edits so unrelated changes are not included. The pre-commit GitHub Actions workflow runs on pull requests, so the hooks are enforced in CI.
 - No general-purpose Python formatter is currently enforced (`ruff format` is deliberately not adopted yet). Preserve the surrounding file's formatting and avoid unrelated rewrites or repository-wide formatting.
 - Prefer double quotes for Python strings where consistent with the surrounding file.
 - Match existing docstring and comment style—concise English comments using imperative phrasing only where necessary.
 - Configuration files in `pr_agent/settings/` are TOML; preserve formatting, section order, and comments when editing prompts or defaults.
-- Markdown in `docs/` uses MkDocs conventions (YAML front matter absent; rely on heading hierarchy already in place).
+- Markdown in `docs/` uses Docusaurus conventions: every page starts with YAML front matter (`title`, `sidebar_position`), admonitions use `:::note` fences, collapsible sections use `<details>`, and images live in `docs/static/img/` referenced as `/img/<file>`. Pages stay `.md` (CommonMark) unless they need a JSX component, in which case they are `.mdx`. Register every new page in `docs/sidebars.js`.
 
 ## Testing Guidelines
 
@@ -97,7 +97,7 @@ Ruff is the single linting tool: `pyproject.toml` configures it and the pre-comm
 - Follow `CONTRIBUTING.md`: keep changes focused, add or update tests, and use Conventional Commit-style messages (e.g., `fix: handle missing repo settings gracefully`).
 - Target branch names follow `feature/<name>` or `fix/<issue>` patterns for substantial work.
 - Reference related issues and update README or docs when user-facing behavior shifts.
-- Ensure CI workflows (`build-and-test`, `code-coverage`, `docs-ci`) succeed locally or in draft PRs before requesting review; reproduce failures with the documented commands above.
+- Before requesting review, run the relevant local checks above and make sure the corresponding CI workflows (`build-and-test`, `pre-commit`) pass; coverage is collected and uploaded by `build-and-test`, and `docs-ci` builds the documentation on every pull request that touches `docs/**` (publishing only on pushes to `main` and `add-docs-portal`). That build fails on broken links and anchors, and also runs `scripts/check_docs_urls.py` to confirm the documentation URLs hardcoded in `pr_agent/` and the README still resolve.
 - Include screenshots or terminal captures when modifying user-visible output or documentation previews.
 
 ## Safety and Permissions

@@ -1,3 +1,11 @@
+import openai
+from tenacity import retry, retry_if_exception_type, retry_if_not_exception_type, stop_after_attempt
+
+from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
+from pr_agent.algo.run_details import record_ai_call
+from pr_agent.config_loader import get_settings
+from pr_agent.log import get_logger
+
 _LANGCHAIN_INSTALLED = False
 
 try:
@@ -7,15 +15,6 @@ try:
     _LANGCHAIN_INSTALLED = True
 except:  # we don't enforce langchain as a dependency, so if it's not installed, just move on
     pass
-
-
-import openai
-from tenacity import retry, retry_if_exception_type, retry_if_not_exception_type, stop_after_attempt
-
-from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
-from pr_agent.algo.run_details import record_ai_call
-from pr_agent.config_loader import get_settings
-from pr_agent.log import get_logger
 
 OPENAI_RETRIES = 5
 
@@ -59,17 +58,21 @@ class LangChainOpenAIHandler(BaseAiHandler):
                     )
         except AttributeError as e:
             # Handle configuration errors
-            error_msg = f"OpenAI {e.name} is required" if getattr(e, "name") else str(e)
+            error_msg = f"OpenAI {e.name} is required" if e.name else str(e)
             get_logger().error(error_msg)
             raise ValueError(error_msg) from e
 
     @retry(
-        retry=retry_if_exception_type(openai.APIError) & retry_if_not_exception_type(openai.RateLimitError),
+        retry=retry_if_exception_type(openai.APIError) & retry_if_not_exception_type(
+            (openai.RateLimitError, openai.BadRequestError, openai.UnprocessableEntityError)
+        ),
         stop=stop_after_attempt(OPENAI_RETRIES),
     )
-    async def chat_completion(self, model: str, system: str, user: str, temperature: float = 0.2, img_path: str = None):
+    async def chat_completion(
+            self, model: str, system: str, user: str, temperature: float = 0.2, img_path: str|None = None):
         if img_path:
-            get_logger().warning(f"Image path is not supported for LangChainOpenAIHandler. Ignoring image path: {img_path}")
+            get_logger().warning(
+                f"Image path is not supported for LangChainOpenAIHandler. Ignoring image path: {img_path}")
         try:
             messages = [SystemMessage(content=system), HumanMessage(content=user)]
             llm = await self._create_chat_async(deployment_id=self.deployment_id)

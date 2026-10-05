@@ -1,18 +1,19 @@
 """Focused unit tests for PRQuestions / PR_LineQuestions pure helpers.
 
-These tests avoid constructing the tool objects through their public
-``__init__`` (which would create real git providers and a TokenHandler).
-Instead, instances are built with ``__new__`` and only the attributes needed
-by the method under test are populated. No live providers and no AI calls.
+Construct helper-test instances with ``__new__``. Use the real initializer with
+provider and token-handler stubs for raw-dispatch tests. Avoid live providers and AI calls.
 """
 
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from starlette_context import request_cycle_context
 
+import pr_agent.agent.pr_agent as pr_agent_module
 import pr_agent.tools.pr_line_questions as plq
-from pr_agent.algo.utils import format_pr_questions_header
+from pr_agent.algo.comment_identity import format_pr_questions_header
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import AzureDevopsProvider
 from pr_agent.git_providers.codecommit_provider import CodeCommitProvider
@@ -20,7 +21,7 @@ from pr_agent.git_providers.gerrit_provider import GerritProvider, adopt_to_gerr
 from pr_agent.git_providers.git_provider import GitProvider
 from pr_agent.git_providers.github_provider import GithubProvider
 from pr_agent.git_providers.gitlab_provider import GitLabProvider
-from pr_agent.tools.pr_questions import PRQuestions
+from pr_agent.tools.pr_questions import PRQuestions, _sanitize_slash_commands
 from tests.unittest._settings_helpers import SENTINEL, restore_settings, snapshot_settings
 
 
@@ -85,6 +86,103 @@ class TestPRQuestionsParseArgs:
         pr = _make_pr_questions()
         encoded = "__pr_agent_encoded_text__:does%20--some_key%3D1%20change%20the%20request%3F"
         assert pr.parse_args([encoded]) == "does --some_key=1 change the request?"
+
+
+@pytest.fixture
+def raw_question_tools(monkeypatch):
+    tools = []
+    provider = MagicMock()
+    provider.supports_threaded_pr_questions.return_value = False
+    provider.is_supported.return_value = False
+
+    async def capture_question(self):
+        self.prediction = "Example answer"
+        tools.append(self)
+
+    monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda _url: None)
+    monkeypatch.setattr(pr_agent_module, "reapply_artifact_context", lambda: None)
+    monkeypatch.setattr(pr_agent_module, "flush_telemetry", lambda: None)
+    monkeypatch.setattr("pr_agent.tools.pr_questions.get_git_provider", lambda: lambda _url: provider)
+    monkeypatch.setattr("pr_agent.tools.pr_questions.get_main_pr_language", lambda *_args: "Python")
+    monkeypatch.setattr("pr_agent.tools.pr_questions.TokenHandler", lambda *_args: None)
+    monkeypatch.setattr(PRQuestions, "run", capture_question)
+
+    with request_cycle_context({"settings": deepcopy(get_settings())}):
+        get_settings().set("CONFIG.RESPONSE_LANGUAGE", "en-us")
+        get_settings().set("SKILLS.ENABLED", False)
+        yield tools
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command_request", "expected"),
+    [
+        ('/ask "What\'s changed?"', "What's changed?"),
+        ("/ask What's changed in Bob's file?", "What's changed in Bob's file?"),
+        ("/ask prefix' with spaces'", "prefix' with spaces'"),
+        ("/ask 'What's changed?'", "'What's changed?'"),
+        ('/ask prefix" with spaces"', "prefix with spaces"),
+        (r'/ask "What does \"quoted\" mean in C:\\src?"', 'What does "quoted" mean in C:\\src?'),
+        (r'/ask "What\'s changed?"', r"What\'s changed?"),
+        (r"/ask What\'s changed?", "What's changed?"),
+    ],
+)
+async def test_raw_ask_preserves_question_through_rendering(raw_question_tools, command_request, expected):
+    handled = await pr_agent_module.PRAgent(ai_handler=SimpleNamespace).handle_request(
+        "https://example.com/org/repo/pull/1", command_request
+    )
+
+    assert handled is True
+    tool, = raw_question_tools
+    assert tool.question_str == expected
+    assert tool.vars["questions"] == expected
+    assert f"\n{expected}\n\n### **Answer:**\nExample answer\n" in tool._prepare_pr_answer()
+
+
+@pytest.mark.asyncio
+async def test_raw_ask_applies_quoted_setting_value(raw_question_tools):
+    handled = await pr_agent_module.PRAgent(ai_handler=SimpleNamespace).handle_request(
+        "https://example.com/org/repo/pull/1",
+        '/ask "What changed?" --pr_questions.extra_instructions="Keep Bob\'s wording"',
+    )
+
+    assert handled is True
+    tool, = raw_question_tools
+    assert tool.question_str == "What changed?"
+    assert tool.vars["extra_instructions"] == "Keep Bob's wording"
+
+
+@pytest.mark.asyncio
+async def test_raw_command_preserves_positional_arguments(raw_question_tools, monkeypatch):
+    tool = MagicMock()
+    tool.run = AsyncMock()
+    factory = MagicMock(return_value=tool)
+    monkeypatch.setitem(pr_agent_module.command2class, "custom", factory)
+
+    handled = await pr_agent_module.PRAgent(ai_handler=SimpleNamespace).handle_request(
+        "https://example.com/org/repo/pull/1",
+        '/custom before "two words" prefix\' with spaces\' --pr_questions.extra_instructions="text" after --extended',
+    )
+
+    assert handled is True
+    factory.assert_called_once_with(
+        "https://example.com/org/repo/pull/1", ai_handler=SimpleNamespace,
+        args=["before", "two words", "prefix'", "with", "spaces'", "after", "extended"],
+    )
+    assert get_settings().pr_questions.extra_instructions == "text"
+    tool.run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command_request", ['/ask "unfinished', "/ask trailing\\"])
+async def test_raw_ask_rejects_unfinished_quotes_and_escapes(raw_question_tools, command_request):
+    notify = MagicMock()
+
+    assert await pr_agent_module.PRAgent(ai_handler=SimpleNamespace).handle_request(
+        "https://example.com/org/repo/pull/1", command_request, notify
+    ) is False
+    assert raw_question_tools == []
+    notify.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +442,74 @@ class TestPreparePrAnswer:
         out = pr._prepare_pr_answer()
         assert "this change looks correct" in out
         assert "Model answer contains GitHub quick actions" not in out
+
+
+class TestSanitizeSlashCommands:
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            ("/merge this now", " /merge this now"),
+            ("please\n/close this", "please\n /close this"),
+            ("please\r/close this", "please\r /close this"),
+            ("what does /merge do here?", "what does /merge do here?"),
+            ("", ""),
+        ],
+    )
+    def test_no_line_starts_with_slash(self, text, expected):
+        assert _sanitize_slash_commands(text) == expected
+
+
+class TestQuestionEchoSanitization:
+    def test_question_with_leading_slash_is_space_prefixed(self):
+        pr = _make_pr_questions(
+            question_str="/merge this now", prediction="no", git_provider=MagicMock()
+        )
+        out = pr._prepare_pr_answer()
+        assert "\n /merge this now" in out
+        assert "\n/merge" not in out
+
+    def test_question_with_newline_slash_is_space_prefixed(self):
+        pr = _make_pr_questions(
+            question_str="why?\n/merge now", prediction="no", git_provider=MagicMock()
+        )
+        out = pr._prepare_pr_answer()
+        assert "\n /merge now" in out
+        assert "\n/merge" not in out
+
+    def test_question_with_carriage_return_slash_is_neutralized(self):
+        pr = _make_pr_questions(
+            question_str="why?\r/close", prediction="no", git_provider=MagicMock()
+        )
+        out = pr._prepare_pr_answer()
+        assert "\r /close" in out
+        assert "\r/close" not in out
+
+    def test_mid_line_slash_mention_in_question_survives(self):
+        pr = _make_pr_questions(
+            question_str="what does /merge do here?", prediction="no", git_provider=MagicMock()
+        )
+        out = pr._prepare_pr_answer()
+        assert "what does /merge do here?" in out
+
+
+class TestLineQuestionAnswerSanitization:
+    @pytest.mark.asyncio
+    async def test_carriage_return_slash_is_neutralized(self, monkeypatch, line_question_settings):
+        line_question_settings.set("comment_id", 42)
+        line_question_settings.set("file_name", "t.py")
+        lq = _make_line_questions()
+        lq.git_provider.get_diff_files.return_value = [SimpleNamespace(filename="t.py", patch="diff")]
+
+        async def get_answer(*args, **kwargs):
+            return "Done.\n\r/merge"
+
+        monkeypatch.setattr("pr_agent.tools.pr_line_questions.extract_hunk_lines_from_patch",
+                            MagicMock(return_value=("@@ -1,1 +1,1 @@\n patch", "selected")))
+        monkeypatch.setattr("pr_agent.tools.pr_line_questions.retry_with_fallback_models", get_answer)
+
+        await lq.run()
+
+        lq.git_provider.reply_to_comment_from_comment_id.assert_called_once_with(42, "Done.\n\r /merge")
 
 
 class TestPublishPrAnswer:
@@ -691,6 +857,26 @@ class TestExtraInstructionsPromptRendering:
 # ---------------------------------------------------------------------------
 
 class TestResolveThreadsPromptRendering:
+    @pytest.mark.parametrize("whitespace", ["  ", "\t"])
+    def test_diff_payloads_preserve_trailing_whitespace(self, whitespace):
+        variables = {
+            "title": "test",
+            "branch": "main",
+            "full_hunk": f"@@ -1 +1 @@\n-old\n+new{whitespace}",
+            "selected_lines": f"+new{whitespace}",
+            "question": "why did this change?",
+            "conversation_history": "",
+            "resolve_threads": False,
+            "extra_instructions": "",
+        }
+
+        user_prompt = _render_jinja_template(
+            get_settings().pr_line_questions_prompt.user, variables
+        )
+
+        assert f"+new{whitespace}\n======" in user_prompt
+        assert user_prompt.count(f"+new{whitespace}\n======") == 2
+
     def test_resolve_threads_marker_instruction_included_when_enabled(self):
         variables = {
             "title": "test",

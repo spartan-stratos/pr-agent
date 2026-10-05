@@ -1,3 +1,8 @@
+---
+title: "Gitea Integration"
+sidebar_position: 8
+---
+
 ## Run a Gitea webhook server
 
 1. In Gitea create a new user and give it "Reporter" role for the intended group or project.
@@ -9,6 +14,8 @@
     ```bash
     WEBHOOK_SECRET=$(python -c "import secrets; print(secrets.token_hex(10))")
     ```
+
+    The webhook secret is required: if `GITEA.WEBHOOK_SECRET` is not configured, the server rejects every incoming webhook with HTTP 403.
 
 4. Clone this repository:
 
@@ -57,3 +64,11 @@
 9. Test your installation by opening a merge request or commenting on a merge request using one of PR Agent's commands.
 
 10. The webhook server runs under gunicorn with multiple worker processes. See [Sizing a self-hosted webhook server](./index.md#sizing-a-self-hosted-webhook-server) for the `GUNICORN_WORKERS` / `GUNICORN_MAX_WORKERS` knobs and memory guidance — worth reading before setting a memory limit.
+
+## Incomplete pull-request files
+
+PR-Agent stops the command when Gitea cannot supply complete, valid changed-file data, rather than analyzing a partial change set.
+
+When `CONFIG.PUBLISH_OUTPUT` is enabled, PR-Agent attempts to post a **PR-Agent command was not run** notice with a Gitea-specific explanation. Publishing this notice is best effort; it may not appear if the provider cannot post it.
+
+Retry the command. If the problem persists, inspect the pull request's changed files and diff in Gitea.
