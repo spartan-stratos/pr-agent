@@ -52,6 +52,27 @@ while IFS= read -r f; do
         *flyway.conf|*/database-migration/*)
             add_stack database
             ;;
+        # A CI/deploy gating script is infrastructure: .github/scripts/eks-rollout-wait.sh and
+        # amplify-deploy-wait.sh decide whether a rollout is considered healthy, and that logic
+        # never appears in the workflow yml that calls them.
+        .github/scripts/*.sh|*/.github/scripts/*.sh)
+            add_stack infrastructure
+            ;;
+        # A rendered template is the file that actually runs. *.tftpl is a Terraform-generated
+        # buildspec; *.mustache is the OpenAPI generator's client template, so a change there
+        # rewrites every generated Retrofit call site without touching a single .kt file.
+        *.tftpl)
+            add_stack infrastructure
+            ;;
+        *.mustache)
+            add_stack backend-micronaut
+            ;;
+        # i18n bundles carry locale-completeness defects: a key added to messages.properties and
+        # not to messages_vi.properties ships the English string to Vietnamese users. No compiler
+        # or linter compares the two files.
+        */resources/messages*.properties|*/resources/*-strings*.properties|*/resources/*advice*.properties|*/i18n/*.properties)
+            add_stack backend-micronaut
+            ;;
     esac
 done
 

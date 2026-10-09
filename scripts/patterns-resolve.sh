@@ -13,6 +13,11 @@ fi
 INPUT="$(cat)"
 [ -n "$INPUT" ] || exit 0
 
+# Repo identity for the `repos:` scope line, as `<owner>/<repo>` or just `<repo>`. Empty means
+# "unknown", and an unknown repo gets the GLOBAL patterns only - a repo-scoped pattern is never
+# guessed into a review.
+PATTERN_REPO_LC="$(printf '%s' "${PRAGENT_PATTERN_REPO:-}" | tr '[:upper:]' '[:lower:]')"
+
 INPUT_LC="$(printf '%s' "$INPUT" | tr '[:upper:]' '[:lower:]')"
 
 # Overrideable so a stack whose diffs genuinely hinge on one of these can re-enable it.
@@ -34,6 +39,34 @@ scan_dir() {
         [ -f "$file" ] || continue
         trigger_line="$(grep -im1 '^triggers:' "$file" 2>/dev/null || true)"
         [ -n "$trigger_line" ] || continue
+
+        # `repos: <token> [<token> ...]` restricts a pattern to the repos it was written from.
+        #
+        # WHY this exists: triggers are OR-matched single tokens, so a pattern written for one
+        # repo and triggered on words like `default`, `manager`, `delete` or `@Singleton` fires on
+        # EVERY Kotlin repo. Measured 2026-10-09 over 200 service-dietfit commits: the median diff
+        # selected ~10 of 16 patterns, roughly 30k characters against review-local.sh's 14000-char
+        # conventions cap. CONV is truncated head-keep, so the stack rules appended last were
+        # silently discarded on every review, and the summary line still reported `patterns=10`
+        # because it counts what was SELECTED, not what survived. Narrowing the triggers alone
+        # would have cost those patterns their recall on their OWN repo; scoping keeps both.
+        #
+        # A substring match is deliberate so `service-dietfit` matches `spartan-stratos/service-dietfit`.
+        repos_line="$(grep -im1 '^repos:' "$file" 2>/dev/null || true)"
+        if [ -n "$repos_line" ]; then
+            repo_ok=0
+            if [ -n "$PATTERN_REPO_LC" ]; then
+                for want in ${repos_line#*:}; do
+                    want="$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')"
+                    [ -n "$want" ] || continue
+                    case "$PATTERN_REPO_LC" in
+                        *"$want"*) repo_ok=1; break ;;
+                    esac
+                done
+            fi
+            [ "$repo_ok" -eq 1 ] || continue
+        fi
+
         triggers="${trigger_line#*:}"
         for trigger in $triggers; do
             trigger="$(printf '%s' "$trigger" | tr '[:upper:]' '[:lower:]')"

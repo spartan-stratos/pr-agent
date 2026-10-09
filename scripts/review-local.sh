@@ -234,13 +234,42 @@ if [[ "$PR_URL" == https://github.com/*/pull/* ]]; then
     fi
 fi
 
+# Repo identity for `repos:`-scoped pattern files (see scripts/patterns-resolve.sh). In --local
+# mode the PR URL carries nothing, so fall back to the origin remote of the repo being reviewed.
+# Left empty on failure, which means global patterns only - never a guess.
+if [ -z "${PRAGENT_PATTERN_REPO:-}" ]; then
+    if [ -n "$REPO_PATH" ]; then
+        PRAGENT_PATTERN_REPO="$REPO_PATH"
+    else
+        _origin="$(git remote get-url origin 2>/dev/null || true)"
+        if [ -n "$_origin" ]; then
+            _origin="${_origin%.git}"
+            _origin="${_origin##*:}"
+            PRAGENT_PATTERN_REPO="$(printf '%s' "$_origin" | awk -F/ 'NF>=2 {print $(NF-1)"/"$NF}')"
+        fi
+    fi
+fi
+export PRAGENT_PATTERN_REPO
+
 _conv_start="$(_now)"
 PERSONAL_CONVENTIONS_LOADED=no
 REPO_AGENTS_LOADED=no
 CLAUDE_MD_LOADED=no
 PATTERNS_LOADED=0
+PATTERNS_SKIPPED=0
 STACKS_DISPLAY=none
 CONV=""
+
+# The patterns tier gets its OWN sub-budget inside CONV_CAP so it cannot starve the stack rules.
+# Patterns are appended first on purpose (they are trigger-matched to THIS diff, stack rules are
+# generic), and CONV truncation is head-keep - so without a sub-budget a diff that selects six
+# patterns consumes the whole 14000 and every stack rule is silently discarded. Measured
+# 2026-10-09 over 200 service-dietfit commits: before the `repos:` scope line the median diff
+# selected ~10 of 16 patterns / ~30k chars; after scoping, median 2 / ~5k, but the p90 was still
+# 13k. A pattern beyond the tier cap is SKIPPED and counted, so the summary line shows it instead
+# of it vanishing into the head-keep cut.
+PATTERN_TIER_CAP="${PRAGENT_PATTERN_TIER_CAP:-9000}"
+PATTERN_TIER_CHARS=0
 
 if [ -f "$HOME/.config/pr-agent/conventions.md" ]; then
     CONV+=$'## Personal conventions\n'
@@ -307,7 +336,13 @@ if [ "$LOCAL_MODE" = "1" ]; then
                 CHUNK="$(cat "$pfile" 2>/dev/null || true)"
                 if [ -n "$CHUNK" ]; then
                     pname="$(basename "$pfile" .md)"
-                    CONV+="## pattern: $pname"$'\n'"${CHUNK:0:${PRAGENT_PATTERN_CHARS:-3000}}"$'\n'
+                    PCHUNK="${CHUNK:0:${PRAGENT_PATTERN_CHARS:-3000}}"
+                    if [ $(( PATTERN_TIER_CHARS + ${#PCHUNK} )) -gt "$PATTERN_TIER_CAP" ]; then
+                        PATTERNS_SKIPPED=$((PATTERNS_SKIPPED + 1))
+                        continue
+                    fi
+                    CONV+="## pattern: $pname"$'\n'"$PCHUNK"$'\n'
+                    PATTERN_TIER_CHARS=$(( PATTERN_TIER_CHARS + ${#PCHUNK} ))
                     PATTERNS_LOADED=$((PATTERNS_LOADED + 1))
                 fi
             done < <(printf '%s\n' "$PATTERN_INPUT" | "$ROOT/scripts/patterns-resolve.sh" $STACKS 2>/dev/null)
@@ -384,7 +419,13 @@ elif [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$OWNER" ] && [ -n "$RE
             CHUNK="$(cat "$pfile" 2>/dev/null || true)"
             if [ -n "$CHUNK" ]; then
                 pname="$(basename "$pfile" .md)"
-                CONV+="## pattern: $pname"$'\n'"${CHUNK:0:${PRAGENT_PATTERN_CHARS:-3000}}"$'\n'
+                PCHUNK="${CHUNK:0:${PRAGENT_PATTERN_CHARS:-3000}}"
+                if [ $(( PATTERN_TIER_CHARS + ${#PCHUNK} )) -gt "$PATTERN_TIER_CAP" ]; then
+                    PATTERNS_SKIPPED=$((PATTERNS_SKIPPED + 1))
+                    continue
+                fi
+                CONV+="## pattern: $pname"$'\n'"$PCHUNK"$'\n'
+                PATTERN_TIER_CHARS=$(( PATTERN_TIER_CHARS + ${#PCHUNK} ))
                 PATTERNS_LOADED=$((PATTERNS_LOADED + 1))
             fi
         done < <(printf '%s\n' "$PATTERN_INPUT" | "$ROOT/scripts/patterns-resolve.sh" $STACKS 2>/dev/null)
@@ -447,7 +488,7 @@ fi
 
 export PR_REVIEWER__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
 export PR_CODE_SUGGESTIONS__EXTRA_INSTRUCTIONS="$EXTRA_INSTRUCTIONS"
-echo "conventions: personal=$PERSONAL_CONVENTIONS_LOADED stacks=$STACKS_DISPLAY patterns=$PATTERNS_LOADED conv-chars=$CONV_CHARS_PRE/$CONV_CAP dropped=$CONV_TRUNC repo-AGENTS=$REPO_AGENTS_LOADED claude-md=$CLAUDE_MD_LOADED workspace-ctx=$WORKSPACE_CTX score-threshold=$PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD" >&2
+echo "conventions: personal=$PERSONAL_CONVENTIONS_LOADED stacks=$STACKS_DISPLAY patterns=$PATTERNS_LOADED pattern-skipped=$PATTERNS_SKIPPED pattern-chars=$PATTERN_TIER_CHARS/$PATTERN_TIER_CAP conv-chars=$CONV_CHARS_PRE/$CONV_CAP dropped=$CONV_TRUNC repo-AGENTS=$REPO_AGENTS_LOADED claude-md=$CLAUDE_MD_LOADED workspace-ctx=$WORKSPACE_CTX score-threshold=$PR_CODE_SUGGESTIONS__SUGGESTIONS_SCORE_THRESHOLD" >&2
 _phase conventions "$_conv_start"
 
 # Real diff file list/size, used for review-coverage accounting, the improve
