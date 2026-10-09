@@ -35,6 +35,7 @@ from pr_agent.algo.git_patch_processing import (
     to_hunk_only_patch,
 )
 from pr_agent.algo.language_handler import build_language_file_matcher
+from pr_agent.algo.output_models import PRType
 from pr_agent.algo.types import FilePatchInfo
 from pr_agent.config_loader import get_settings, get_verbosity_level
 from pr_agent.log import get_logger
@@ -392,12 +393,26 @@ def convert_to_markdown_v2(output_data: dict,
                 if gfm_supported:
                     markdown_text += "</td></tr>\n"
         else:
+            key_nice = html.escape(key_nice)
+            if isinstance(value, (dict, list)):
+                value_str = yaml.safe_dump(value, default_flow_style=False, allow_unicode=True).strip()
+            elif isinstance(value, (tuple, set)):
+                value_str = yaml.safe_dump(list(value), default_flow_style=False, allow_unicode=True).strip()
+            else:
+                value_str = str(value).strip()
+            value_str = html.escape(value_str)
             if gfm_supported:
+                value_display = "<br>".join(value_str.splitlines())
                 markdown_text += "<tr><td>"
-                markdown_text += f"{emoji}&nbsp;<strong>{key_nice}</strong>: {value}"
+                markdown_text += f"{emoji}&nbsp;<strong>{key_nice}</strong>: {value_display}"
                 markdown_text += "</td></tr>\n"
             else:
-                markdown_text += f"### {emoji} {key_nice}: {value}\n\n"
+                key_nice = key_nice.replace("[", r"\[").replace("]", r"\]")
+                value_str = value_str.replace("[", r"\[").replace("]", r"\]")
+                if "\n" in value_str:
+                    markdown_text += f"### {emoji} {key_nice}\n\n{value_str}\n\n"
+                else:
+                    markdown_text += f"### {emoji} {key_nice}: {value_str}\n\n"
 
     if gfm_supported:
         markdown_text += "</table>\n"
@@ -499,8 +514,10 @@ def ticket_markdown_logic(emoji, markdown_text, value, gfm_supported) -> str:
                     explanation += f"Non-compliant requirements:\n\n{not_compliant_str}\n\n"
                 if requires_further_human_verification:
                     explanation += f"Requires further human verification:\n\n{requires_further_human_verification}\n\n"
+                ticket_title = ticket_url.split('/')[-1] if ticket_url else "Untracked ticket"
+                ticket_reference = f"[{ticket_title}]({ticket_url})" if ticket_url else ticket_title
                 ticket_compliance_str += (
-                    f"\n\n**[{ticket_url.split('/')[-1]}]({ticket_url}) - "
+                    f"\n\n**{ticket_reference} - "
                     f"{ticket_compliance_level}**\n\n{explanation}\n\n"
                 )
 
@@ -563,12 +580,13 @@ def process_can_be_split(emoji, value):
         # key_nice = "Can this PR be split?"
         key_nice = "Multiple PR themes"
         markdown_text = ""
-        if not value or isinstance(value, list) and len(value) == 1:
-            value = "No"
+        if isinstance(value, str) and value.strip().lower() in ("no", "none", "false"):
+            value = None
+        if not value or isinstance(value, dict) or isinstance(value, list) and len(value) <= 1:
             # markdown_text += f"<tr><td> {emoji}&nbsp;<strong>{key_nice}</strong></td><td>\n\n{value}\n\n</td></tr>\n"
             # markdown_text += f"### {emoji} No multiple PR themes\n\n"
             markdown_text += f"{emoji} <strong>No multiple PR themes</strong>\n\n"
-        else:
+        elif isinstance(value, list):
             markdown_text += f"{emoji} <strong>{key_nice}</strong><br><br>\n\n"
             for split in value:
                 title = split.get('title', '')
@@ -1086,7 +1104,7 @@ def try_fix_yaml(response_text: str,
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after adding |-\n")
             return data
-    except:
+    except Exception:
         pass
 
     # 1.5 fallback - try to convert '|' to '|2'. Will solve cases of indent decreasing during the code
@@ -1097,7 +1115,7 @@ def try_fix_yaml(response_text: str,
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after replacing | with |2")
             return data
-    except:
+    except Exception:
         pass
     # try to add spaces to lines that are not indented properly, and contain '}'.
     # Moved out of the except block so it also runs when safe_load returned None (e.g. empty input).
@@ -1131,7 +1149,7 @@ def try_fix_yaml(response_text: str,
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after replacing | with |2 and adding spaces")
             return data
-    except:
+    except Exception:
         pass
 
     # second fallback - try to extract only range from first ```yaml to the last ```
@@ -1158,7 +1176,7 @@ def try_fix_yaml(response_text: str,
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after removing curly brackets")
             return data
-    except:
+    except Exception:
         pass
 
 
@@ -1185,7 +1203,7 @@ def try_fix_yaml(response_text: str,
                 if data is not None:
                     get_logger().info("Successfully parsed AI prediction after extracting yaml snippet")
                     return data
-            except:
+            except Exception:
                 pass
 
     # fifth fallback - try to remove leading '+' (sometimes added by AI for 'existing code' and 'improved code')
@@ -1198,7 +1216,7 @@ def try_fix_yaml(response_text: str,
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after removing leading '+'")
             return data
-    except:
+    except Exception:
         pass
 
     # 5.5 fallback - try to normalize diff-style removal markers ('-') within list items
@@ -1249,7 +1267,7 @@ def try_fix_yaml(response_text: str,
             if data is not None:
                 get_logger().info("Successfully parsed AI prediction after replacing tabs with spaces")
                 return data
-        except:
+        except Exception:
             pass
 
     # seventh fallback - add indent for sections of code blocks
@@ -1276,7 +1294,7 @@ def try_fix_yaml(response_text: str,
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after adding indent for sections of code blocks")
             return data
-    except:
+    except Exception:
         pass
 
     # eighth fallback - try to remove pipe chars at the root-level dicts
@@ -1287,7 +1305,7 @@ def try_fix_yaml(response_text: str,
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after removing pipe chars")
             return data
-    except:
+    except Exception:
         pass
 
     # ninth fallback - try to decode the response text with different encodings.
@@ -1299,7 +1317,7 @@ def try_fix_yaml(response_text: str,
             if data:
                 get_logger().info(f"Successfully parsed AI prediction after decoding with {encoding} encoding")
                 return data
-        except:
+        except Exception:
             pass
 
     # # sixth fallback - try to remove last lines
@@ -1344,6 +1362,29 @@ def set_custom_labels(variables, git_provider=None):
         labels_minimal_to_labels_dict[k.lower().replace(' ', '_')] = k
         counter += 1
     variables["labels_minimal_to_labels_dict"] = labels_minimal_to_labels_dict
+
+def filter_generated_labels(labels: List[str]) -> List[str]:
+    """Keep model-generated labels within the enabled vocabulary, not user labels."""
+    names = [label.value for label in PRType]
+    if get_settings().config.get("enable_custom_labels", False):
+        custom_labels = get_settings().get("custom_labels", {}) or _DEFAULT_CUSTOM_LABELS
+        names.extend(str(label) for label in custom_labels)
+    allowed = {name.lower() for name in names}
+    # Resolve prompt enum keys (e.g. bug_fix) to allowed display names.
+    aliases = {name.lower().replace(" ", "_"): name for name in names}
+    accepted = []
+    dropped = []
+    for label in labels:
+        if isinstance(label, str) and label.strip().lower() in allowed:
+            accepted.append(label.strip())
+        elif isinstance(label, str) and label.strip().lower() in aliases:
+            accepted.append(aliases[label.strip().lower()])
+        else:
+            dropped.append(label)
+    if dropped:
+        get_logger().warning(f"Dropping model-generated labels outside the configured set: {dropped}", artifact=dropped)
+    return accepted
+
 
 def get_user_labels(current_labels: List[str] = None):
     """
@@ -1448,7 +1489,7 @@ def find_line_number_of_relevant_line_in_file(diff_files: List[FilePatchInfo],
                         relevant_line_in_file = matches_difflib[0]
 
 
-                def scan_patch_lines(is_match):
+                def scan_patch_lines(is_match, patch_lines=patch_lines, absolute_position=absolute_position):
                     scan_delta = 0
                     scan_start2 = 0
                     skip_hunk = False
@@ -1476,10 +1517,10 @@ def find_line_number_of_relevant_line_in_file(diff_files: List[FilePatchInfo],
                     return -1, absolute_position
 
                 position, absolute_position = scan_patch_lines(
-                    lambda line: line == relevant_line_in_file or line[1:] == relevant_line_in_file)
+                    lambda line, rl=relevant_line_in_file: line == rl or line[1:] == rl)
                 if position == -1:
                     position, absolute_position = scan_patch_lines(
-                        lambda line: relevant_line_in_file in line)
+                        lambda line, rl=relevant_line_in_file: rl in line)
 
                 if position == -1 and relevant_line_in_file[0] == '+':
                     no_plus_line = relevant_line_in_file[1:].lstrip()

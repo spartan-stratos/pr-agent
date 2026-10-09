@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Iterator, Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
 
+from pr_agent.agent.request_policy import policy_metadata, policy_value
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 
 from ..algo.comment_identity import (
@@ -41,6 +42,7 @@ from .git_provider import (
     CodeSuggestionThread,
     GitProvider,
     IncrementalPR,
+    cache_languages,
 )
 
 AZURE_DEVOPS_AVAILABLE = True
@@ -178,6 +180,15 @@ def _get_azure_change_type(change):
 
 
 class AzureDevopsProvider(GitProvider):
+
+    def get_request_policy_metadata(self, required_fields: set[str]) -> dict:
+        source = self.pr.source_ref_name
+        target = self.pr.target_ref_name
+        return policy_metadata(title=self.pr.title, sender=policy_value(self.pr, "created_by", "unique_name"),
+                               repo_full_name=f"{self.workspace_slug}/{self.repo_slug}",
+                               source_branch=source.removeprefix("refs/heads/") if source else None,
+                               target_branch=target.removeprefix("refs/heads/") if target else None,
+                               labels=self.get_pr_labels() if "labels" in required_fields else ())
 
     _INCREMENTAL_ANCHOR_PREFIXES = {
         "review": get_pr_review_comment_identifiers(full=True, incremental=True),
@@ -562,6 +573,7 @@ class AzureDevopsProvider(GitProvider):
         self.diff_files = None
         self._diff_path_map = None
         self._pr_iteration_changes_cache = None
+        self._languages = None
         self.pr_commits = None
         self.previous_review = None
         self.unreviewed_files_map = {}
@@ -774,13 +786,13 @@ class AzureDevopsProvider(GitProvider):
     def _get_global_settings_cache_key(self, org: str) -> str:
         return f"azure-devops:{org}:{self.workspace_slug}"
 
-    def _fetch_global_repo_settings(self, org):
-        # Convention: the org-wide <org>/pr-agent-settings settings repository lives in the
-        # same project as the current repository (Azure DevOps orgs contain projects, not
-        # repos directly, so there is no repo addressable purely from the org name).
+    def _fetch_global_repo_settings(self, org, settings_repo):
+        # The org-wide settings repository lives in the same project as the current repository
+        # (Azure DevOps orgs contain projects, not repos directly, so there is no repo
+        # addressable purely from the org name).
         try:
             contents = self.azure_devops_client.get_item_content(
-                repository_id="pr-agent-settings",
+                repository_id=settings_repo,
                 project=self.workspace_slug,
                 download=False,
                 include_content_metadata=False,
@@ -1344,6 +1356,7 @@ class AzureDevopsProvider(GitProvider):
     def get_title(self):
         return self.pr.title
 
+    @cache_languages
     def get_languages(self):
         # Return {language name: percentage}, like the other providers. Keys are
         # language NAMES (e.g. "Python"), not raw extensions: the consumer
@@ -1741,6 +1754,8 @@ class AzureDevopsProvider(GitProvider):
             return response
         except Exception as e:
             get_logger().exception(f"Failed to reply to thread, error: {e}")
+            if not is_temporary:
+                raise
 
     def get_thread_context(self, thread_id: int) -> CommentThreadContext:
         try:

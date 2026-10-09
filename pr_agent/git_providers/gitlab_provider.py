@@ -17,6 +17,7 @@ from gitlab import (
 )
 from requests.exceptions import RequestException
 
+from pr_agent.agent.request_policy import policy_metadata, policy_value
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 
 from ..algo.comment_identity import (
@@ -50,6 +51,7 @@ from .git_provider import (
     get_config_branch,
     redact_credentials,
 )
+from .request_timeout import get_http_request_timeout, refresh_session_request_timeout
 
 
 class DiffNotFoundError(Exception):
@@ -252,6 +254,12 @@ _GITLAB_ACCESS_LEVEL_REPORTER = 20
 
 class GitLabProvider(GitProvider):
 
+    def get_request_policy_metadata(self, required_fields: set[str]) -> dict:
+        return policy_metadata(title=self.mr.title, sender=policy_value(self.mr, "author", "username"),
+                               repo_full_name=self._superproject_path(), source_branch=self.mr.source_branch,
+                               target_branch=self.mr.target_branch,
+                               labels=self.get_pr_labels() if "labels" in required_fields else ())
+
     def __init__(self, merge_request_url: Optional[str] = None, incremental: Optional[bool] = False):
         gitlab_url = get_settings().get("GITLAB.URL", None)
         if not gitlab_url:
@@ -275,17 +283,20 @@ class GitLabProvider(GitProvider):
                 self.gl = gitlab.Gitlab(
                     url=gitlab_url,
                     oauth_token=gitlab_access_token,
-                    ssl_verify=ssl_verify
+                    ssl_verify=ssl_verify,
+                    timeout=get_http_request_timeout(),
                 )
             else:  # private_token
                 self.gl = gitlab.Gitlab(
                     url=gitlab_url,
                     private_token=gitlab_access_token,
-                    ssl_verify=ssl_verify
+                    ssl_verify=ssl_verify,
+                    timeout=get_http_request_timeout(),
                 )
+            refresh_session_request_timeout(self.gl)
         except (GitlabError, RequestException, ValueError) as e:
             get_logger().error(f"Failed to create GitLab instance: {e}")
-            raise ValueError(f"Unable to authenticate with GitLab: {e}")
+            raise ValueError(f"Unable to authenticate with GitLab: {e}") from e
         self.max_comment_chars = 65000
         self.id_project = None
         self.id_mr = None
@@ -485,6 +496,12 @@ class GitLabProvider(GitProvider):
         get_logger().warning(f"[submodule] could not resolve project '{proj_path}': " + "; ".join(failures))
         return None
 
+    def _submodule_target_allowed(self, project) -> bool:
+        """Apply the sibling-repository checks to the resolved submodule project."""
+        path = getattr(project, "path_with_namespace", None) or ""
+        return (self.is_sibling_repo_allowed(path) and path.split("/")[0] == self.get_owning_namespace(resolved=True)
+                and self._requester_can_read_sibling_project(project))
+
     def _compare_submodule(self, proj_path: str, old_sha: str, new_sha: str) -> list[dict]:
         """
         Call repository_compare on submodule project; return list of diffs.
@@ -496,6 +513,10 @@ class GitLabProvider(GitProvider):
             proj = self._project_by_path(proj_path)
             if proj is None:
                 get_logger().warning(f"[submodule] resolve failed for {proj_path}")
+                self._submodule_cache[key] = []
+                return []
+            if not self._submodule_target_allowed(proj):
+                get_logger().warning(f"[submodule] skipping {proj_path}: not an authorized sibling repository")
                 self._submodule_cache[key] = []
                 return []
             cmp = proj.repository_compare(old_sha, new_sha)
@@ -1012,6 +1033,8 @@ class GitLabProvider(GitProvider):
         self, file_path: str, branch: str, contents="", message="", *, expected_snapshot: FileContentSnapshot
     ) -> None:
         """Create or replace a file only against the captured file state."""
+        if int(self.mr.source_project_id) != int(self.mr.target_project_id):
+            raise ValueError("Cannot write to a fork merge request")
         try:
             if expected_snapshot.exists and (
                 not isinstance(expected_snapshot.revision, str) or not expected_snapshot.revision
@@ -2142,12 +2165,12 @@ class GitLabProvider(GitProvider):
     def _get_global_settings_cache_key(self, group: str) -> str:
         return f"gitlab:{getattr(self, 'gitlab_url', '')}:{group}"
 
-    def _fetch_global_repo_settings(self, group):
+    def _fetch_global_repo_settings(self, group, settings_repo):
         try:
-            project = self.gl.projects.get(f"{group}/pr-agent-settings")
+            project = self.gl.projects.get(f"{group}/{settings_repo}")
             return project.files.get(file_path='.pr_agent.toml', ref=project.default_branch).decode()
         except GitlabGetError:
-            # A missing pr-agent-settings project/file is an expected fallback -> return "" (cached).
+            # A missing settings project/file is an expected fallback -> return "" (cached).
             return ""
         # Transient/unexpected errors propagate so the caller does not cache the failure.
 

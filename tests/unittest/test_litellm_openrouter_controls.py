@@ -19,7 +19,10 @@ from litellm.llms.openrouter.chat.transformation import OpenrouterConfig
 from litellm.utils import get_llm_provider, get_optional_params
 
 import pr_agent.algo.ai_handlers.litellm_ai_handler as litellm_handler
-from pr_agent.algo import token_budget
+from pr_agent.algo import (
+    GPT6_MODELS_WITHOUT_NONE_EFFORT,
+    token_budget,
+)
 
 # Environment variables that LiteLLMAIHandler.__init__ reads or mutates: the AWS
 # credential path (entered when AWS_USE_IMDS is set) writes the AWS_* variables,
@@ -108,7 +111,7 @@ async def _run(monkeypatch, model, openrouter, reasoning_effort="medium", custom
 class TestOpenRouterControls:
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
+    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
     @pytest.mark.parametrize("suffix", ["", "_thinking"])
     @pytest.mark.parametrize("provider", ["", "aiohttp_openai", "ollama"])
     async def test_aiohttp_gpt6_prefix_keeps_native_transport_and_provider_overrides(
@@ -485,7 +488,7 @@ class TestOpenRouterControls:
         assert kwargs["max_tokens"] == 16000
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
+    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
     async def test_custom_provider_gpt6_probe_matches_completion_limit(self, monkeypatch, model):
         settings = _make_settings(custom_llm_provider="openrouter")
         settings.config.get = lambda key, default=None: 4096 if key == "max_output_tokens" else default
@@ -506,7 +509,7 @@ class TestOpenRouterControls:
         assert "max_completion_tokens" not in probe
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
+    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
     @pytest.mark.parametrize("suffix", ["", "_thinking"])
     @pytest.mark.parametrize(("prefix", "custom_provider"), [
         ("", "ollama"), ("ollama/", ""), ("", "azure_text"), ("", "text-completion-openai"),
@@ -537,7 +540,7 @@ class TestOpenRouterControls:
         assert "reasoning_effort" not in regular
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
+    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
     @pytest.mark.parametrize("route", [":nitro", ":floor", ":online", ":exacto"])
     async def test_custom_variant_token_budget_matches_request_model(self, monkeypatch, model, route):
         settings = _make_settings(custom_llm_provider="ollama")
@@ -558,7 +561,7 @@ class TestOpenRouterControls:
             metadata.assert_called_once_with(variant)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
+    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
     @pytest.mark.parametrize("alias", [
         "{}_thinking", "openai/{}", "openrouter/openai/{}", "openrouter/openai/{}_thinking",
         "openrouter/openai/{}_thinking:nitro", "openrouter/openai/{}_thinking:floor",
@@ -587,7 +590,7 @@ class TestOpenRouterControls:
             metadata.assert_called_once_with(variant)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
+    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
     @pytest.mark.parametrize("route", [":batch", ":free"])
     @pytest.mark.parametrize(("prefix", "custom_provider"), [
         ("openrouter/openai/", ""), ("openai/", "openrouter"), ("", "openrouter"),
@@ -669,7 +672,7 @@ class TestOpenRouterControls:
             assert "max_tokens" not in kwargs
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
+    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
     @pytest.mark.parametrize(("provider", "suffix"), [("openai_like", ""), ("ollama", "_thinking")])
     async def test_non_native_provider_respects_explicit_reasoning_opt_in(self, monkeypatch, model, provider, suffix):
         settings = _make_settings(custom_llm_provider=provider)
@@ -690,12 +693,15 @@ class TestOpenRouterControls:
         assert kwargs["reasoning_effort"] == "medium"
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
+    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
     @pytest.mark.parametrize(("prefix", "custom_provider"), [("", "azure_ai"), ("azure_ai/", "")])
     @pytest.mark.parametrize("effort", ["none", "medium", "max"])
     async def test_azure_ai_gpt6_uses_native_request_parameters(
         self, monkeypatch, model, prefix, custom_provider, effort
     ):
+        # GPT-6.1 Sol's model page omits "none", so the effort is clamped to "low" before
+        # the extra_body decision and takes the native top-level parameter instead.
+        clamped_none = effort == "none" and model in GPT6_MODELS_WITHOUT_NONE_EFFORT
         settings = _make_settings(reasoning_effort=effort, custom_llm_provider=custom_provider)
         settings.config.get = lambda key, default=None: 4096 if key == "max_output_tokens" else default
         monkeypatch.setattr(litellm_handler, "get_settings", lambda: settings)
@@ -718,11 +724,15 @@ class TestOpenRouterControls:
         assert "max_tokens" not in probe
         assert "temperature" not in regular
         if effort in ("none", "max"):
-            assert "reasoning_effort" not in regular
-            assert regular["extra_body"]["reasoning_effort"] == ("xhigh" if effort == "max" else "none")
+            if clamped_none:
+                assert regular["reasoning_effort"] == "low"
+                assert "extra_body" not in regular
+            else:
+                assert "reasoning_effort" not in regular
+                assert regular["extra_body"]["reasoning_effort"] == ("xhigh" if effort == "max" else "none")
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
+    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
     @pytest.mark.parametrize(("prefix", "custom_provider"), [
         ("openrouter/openai/", ""),
         ("openrouter/openai/", "openrouter"),
@@ -890,7 +900,7 @@ class TestOpenRouterControls:
         assert kwargs["extra_body"]["reasoning"] == {"effort": "high"}
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
+    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra"])
     @pytest.mark.parametrize(("prefix", "custom_provider", "route"), [
         ("openrouter/openai/", "", ""),
         ("openrouter/openai/", "", ":nitro"),
@@ -917,7 +927,7 @@ class TestOpenRouterControls:
         assert "reasoning_effort" not in kwargs
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna"])
+    @pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
     async def test_gpt6_openrouter_budget_keeps_precedence_over_minimal(self, monkeypatch, model):
         logger = MagicMock()
         monkeypatch.setattr(litellm_handler, "get_logger", lambda: logger)
@@ -954,6 +964,39 @@ class TestOpenRouterControls:
             reasoning_effort="high",
         )
         assert kwargs["extra_body"]["reasoning"] == {"effort": "high"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("model", "no_budget", "with_budget"), [
+        # The pages of GPT6_MODELS_WITHOUT_NONE_EFFORT members omit "none", so PR-Agent
+        # corrects an explicit OpenRouter "none" to "low". With a budget that then applies.
+        # Expectations are spelled out rather than derived from the registry, so a wrong
+        # registry entry fails here instead of moving the expectation with it.
+        ("openrouter/openai/gpt-6-astra", {"effort": "low"}, {"max_tokens": 2048}),
+        ("openrouter/openai/gpt-6-astra:nitro", {"effort": "low"}, {"max_tokens": 2048}),
+        ("openrouter/openai/gpt-6.1-sol", {"effort": "low"}, {"max_tokens": 2048}),
+        # Control: GPT-6 Sol and GPT-6 Luna do list "none", which wins over the budget.
+        ("openrouter/openai/gpt-6-sol", {"enabled": False}, {"enabled": False}),
+        ("openrouter/openai/gpt-6-luna", {"enabled": False}, {"enabled": False}),
+    ])
+    @pytest.mark.parametrize("reasoning_max_tokens", [0, 2048])
+    async def test_gpt6_explicit_none_effort_respects_model_support(
+        self, monkeypatch, model, no_budget, with_budget, reasoning_max_tokens
+    ):
+        """openrouter.reasoning_effort is an independent config source and needs the clamp too.
+
+        The inherited config.reasoning_effort path is clamped before this stage, but an explicit
+        openrouter.reasoning_effort reaches it verbatim. An unclamped "none" is checked ahead of
+        the token budget and requests reasoning disablement, discarding the budget, so the clamp is
+        what lets a configured budget take effect.
+        """
+        kwargs = await _run(
+            monkeypatch,
+            model,
+            {"reasoning_effort": "none", "reasoning_max_tokens": reasoning_max_tokens},
+        )
+
+        expected = with_budget if reasoning_max_tokens else no_budget
+        assert kwargs["extra_body"]["reasoning"] == expected
 
     @pytest.mark.asyncio
     async def test_registered_model_inherits_default_global_effort(self, monkeypatch):

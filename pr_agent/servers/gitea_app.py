@@ -9,6 +9,7 @@ from starlette_context import context
 from starlette_context.middleware import RawContextMiddleware
 
 from pr_agent.agent.pr_agent import PRAgent, prepare_command
+from pr_agent.agent.request_policy import RequestOutcome
 from pr_agent.config_loader import get_settings, global_settings
 from pr_agent.git_providers.utils import apply_repo_settings
 from pr_agent.log import LoggingFormat, get_logger, setup_logger
@@ -42,14 +43,7 @@ async def handle_gitea_webhooks(background_tasks: BackgroundTasks, request: Requ
     return {}
 
 async def get_body(request: Request):
-    """Parse and verify webhook request body"""
-    try:
-        body = await request.json()
-    except Exception as e:
-        get_logger().error("Error parsing request body", artifact={'error': e})
-        raise HTTPException(status_code=400, detail="Error parsing request body") from e
-
-
+    """Verify and parse webhook request body"""
     # Verify webhook signature
     webhook_secret = getattr(get_settings().gitea, 'webhook_secret', None)
     if not webhook_secret:
@@ -68,8 +62,13 @@ async def get_body(request: Request):
         verify_signature(body_bytes, webhook_secret, f"sha256={signature_header}")
     except Exception as ex:
         get_logger().error(f"Invalid signature: {ex}")
-        raise HTTPException(status_code=401, detail="Invalid signature")
+        raise HTTPException(status_code=401, detail="Invalid signature") from ex
 
+    try:
+        body = await request.json()
+    except Exception as e:
+        get_logger().error("Error parsing request body", artifact={'error': e})
+        raise HTTPException(status_code=400, detail="Error parsing request body") from e
     return body
 
 async def handle_request(body: Dict[str, Any], event: str):
@@ -163,7 +162,8 @@ async def _perform_commands_gitea(commands_conf: str, agent: PRAgent, body: dict
         try:
             new_command = prepare_command(command)
             get_logger().info(f"{commands_conf}. Performing auto command '{new_command}', for {api_url=}")
-            await agent.handle_request(api_url, new_command)
+            if await agent.handle_request(api_url, new_command) is RequestOutcome.SKIPPED:
+                return RequestOutcome.SKIPPED
         except Exception as e:
             get_logger().error(f"Failed to perform command {command}: {e}")
 

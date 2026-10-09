@@ -23,6 +23,20 @@ from pr_agent.mosaico.dispatch import (
     route_and_run_result,
 )
 
+
+def _patch_questions(monkeypatch, question_class):
+    from pr_agent.agent import pr_agent
+    from pr_agent.mosaico import provider_registration  # noqa: F401
+
+    class CapturedQuestion(question_class):
+        async def run(self):
+            result = await super().run()
+            get_settings().set("data.answer", (self.prediction or "").strip())
+            return result
+
+    monkeypatch.setitem(pr_agent.command2class, "ask", CapturedQuestion)
+
+
 PR_URL = "https://github.com/org/repo/pull/123"
 DEAD_PR_URL = "https://github.com/org/repo/pull/999999999"
 PRIVATE_PR_URL = "https://github.com/acme/private-repo/pull/7"
@@ -385,11 +399,12 @@ class TestAskWithContext:
 
         async def fail_handle_request(self, *a, **k):
             pr_agent_used["called"] = True
-            return True
+            return await original_handle_request(self, *a, **k)
 
         monkeypatch.setattr(dispatch, "_fetch_public_diff", fake_fetch_public_diff)
-        monkeypatch.setattr("pr_agent.tools.pr_questions.PRQuestions", FakePRQuestions)
+        _patch_questions(monkeypatch, FakePRQuestions)
         from pr_agent.agent.pr_agent import PRAgent
+        original_handle_request = PRAgent.handle_request
         monkeypatch.setattr(PRAgent, "handle_request", fail_handle_request)
 
         out = await route_and_run(f"what does this change? {PR_URL}")
@@ -397,7 +412,7 @@ class TestAskWithContext:
         # After Fix B path (a) routes through supplied-diff target, not the raw PR URL.
         assert captured["pr_url"] == "mosaico://supplied-diff"
         assert global_settings.get("CONFIG.GIT_PROVIDER") == "mosaico_diff"
-        assert pr_agent_used["called"] is False
+        assert pr_agent_used["called"] is True
 
     @pytest.mark.asyncio
     async def test_supplied_diff_question_runs_prquestions(self, monkeypatch, restore_settings):
@@ -412,7 +427,7 @@ class TestAskWithContext:
             async def run(self):
                 return ""
 
-        monkeypatch.setattr("pr_agent.tools.pr_questions.PRQuestions", FakePRQuestions)
+        _patch_questions(monkeypatch, FakePRQuestions)
 
         out = await route_and_run(f"what changed here?\n{SAMPLE_DIFF}")
         assert out == "DIFF ANSWER"
@@ -441,10 +456,11 @@ class TestPathFreeText:
 
         async def fail_handle_request(self, *a, **k):
             pr_agent_used["called"] = True
-            return True
+            return await original_handle_request(self, *a, **k)
 
-        monkeypatch.setattr("pr_agent.tools.pr_questions.PRQuestions", FakePRQuestions)
+        _patch_questions(monkeypatch, FakePRQuestions)
         from pr_agent.agent.pr_agent import PRAgent
+        original_handle_request = PRAgent.handle_request
         monkeypatch.setattr(PRAgent, "handle_request", fail_handle_request)
 
         out = await route_and_run("what does this codebase do?")
@@ -604,7 +620,7 @@ class TestDefensiveCapture:
                 raise RuntimeError("boom")
 
         monkeypatch.setattr(dispatch, "_fetch_public_diff", fake_fetch_public_diff)
-        monkeypatch.setattr("pr_agent.tools.pr_questions.PRQuestions", RaisingPRQuestions)
+        _patch_questions(monkeypatch, RaisingPRQuestions)
         # Use a PR URL so the ask path (a) actually runs PRQuestions (free-text no longer
         # invokes it after Fix B); a raise there -> error fallback.
         out = await route_and_run(f"what is the meaning of this? {PR_URL}")
@@ -826,9 +842,7 @@ class TestPublishOutputForced:
         """_run_ask must set CONFIG.PUBLISH_OUTPUT=False before calling PRQuestions.run()
         so that the publish guards in run() never publish_comment to the real PR.
 
-        PRQuestions.parse_args() does a plain join (no --config.* parsing), so the
-        arg-injection trick used by _run_pr_agent cannot apply; a settings.set() is
-        required instead."""
+        The agent applies the explicit non-publishing override after repository settings."""
         publish_output_at_run_time = {}
 
         class CapturingPRQuestions:
@@ -842,9 +856,12 @@ class TestPublishOutputForced:
                     "CONFIG.PUBLISH_OUTPUT", True
                 )
 
-        monkeypatch.setattr("pr_agent.tools.pr_questions.PRQuestions", CapturingPRQuestions)
+        _patch_questions(monkeypatch, CapturingPRQuestions)
 
+        from pr_agent.agent import pr_agent
         from pr_agent.mosaico.dispatch import _run_ask
+        monkeypatch.setattr(pr_agent, "apply_repo_settings", lambda _url: None)
+        monkeypatch.setattr(pr_agent, "enforce_request_policy", lambda _url: None)
         # Force global default to True (production default) so the test would fail
         # if _run_ask does NOT explicitly override it.
         global_settings.set("CONFIG.PUBLISH_OUTPUT", True)
@@ -865,7 +882,11 @@ def _routed(monkeypatch):
     seen = {"fetched": []}
 
     async def fake_handle_request(self, pr_url, request, notify=None):
-        seen["verb"] = next((a.lstrip("/") for a in request if a.startswith("/")), None)
+        seen["verb"] = request[0].lstrip("/")
+        if seen["verb"] == "ask":
+            from pr_agent.algo.utils import decode_user_text_args
+            seen["question"] = decode_user_text_args([request[1]])
+            get_settings().set("data.answer", "ROUTED")
         mosaico_input = global_settings.get("MOSAICO.INPUT") or {}
         seen["files"] = [f.filename for f in mosaico_input.get("files", [])]
         seen["title"] = mosaico_input.get("title")
@@ -890,7 +911,7 @@ def _routed(monkeypatch):
 
     from pr_agent.agent.pr_agent import PRAgent
     monkeypatch.setattr(PRAgent, "handle_request", fake_handle_request)
-    monkeypatch.setattr("pr_agent.tools.pr_questions.PRQuestions", FakePRQuestions)
+    _patch_questions(monkeypatch, FakePRQuestions)
     monkeypatch.setattr(dispatch, "_fetch_public_diff", fake_fetch_public_diff)
     return seen
 
@@ -1183,3 +1204,60 @@ class TestSingleTurnUnchanged:
                                         ("agent", "hi, what can I do?"),
                                         ("user", "review my code please")))
         assert out == "PR-Agent requires a PR URL or a supplied diff."
+
+
+class TestBoundedRoutingDetection:
+    @pytest.mark.parametrize("url", [
+        "https://github.com/org/repo/pull/123", "https://gitea.example/org/repo/pulls/123",
+        "https://gitlab.example/org/repo/-/merge_requests/123", "https://bitbucket.org/org/repo/pull-requests/123",
+        "https://bitbucket.example/org/repo/pullrequest/123",
+        "https://dev.azure.com/org/project/_git/repo/pullrequest/123",
+    ])
+    def test_provider_paths_and_markdown_keep_complete_pr_number(self, url):
+        assert dispatch._find_pr_url(f"Review [{url}]({url}?view=files)") == url
+        assert dispatch._find_pr_url(url.upper()) == url.upper()
+
+    def test_repeated_url_paths_and_negated_verbs_keep_order(self):
+        assert dispatch._find_pr_url("https://" + "_git/" * 6000) is None
+        assert _explicit_verb("do not review " * 4000 + ", describe this") == "describe"
+        assert dispatch._find_pr_url(f"https://invalid.example/path {PR_URL} {DEAD_PR_URL}") == PR_URL
+
+    @pytest.mark.parametrize("text, expected", [
+        ("do not please now /review describe", "describe"),
+        ("rather than just please improve\u2003describe", "describe"),
+        ("nothing to improve here?", "improve"),
+        ("skip this review, /ask why", "ask"),
+        ("no bug, review this", "review"),
+        ("reviewer then /describe", "describe"),
+    ])
+    def test_local_negation_preserves_whitespace_and_punctuation(self, text, expected):
+        assert _explicit_verb(text) == expected
+
+    def test_scan_boundary_never_invents_partial_pr_or_command(self, monkeypatch):
+        settings = get_settings()
+        old = settings.get("MOSAICO.ROUTING_SCAN_MAX_CHARS")
+        try:
+            settings.set("MOSAICO.ROUTING_SCAN_MAX_CHARS", len(PR_URL) - 1)
+            assert dispatch._find_pr_url(PR_URL + " ") is None
+            settings.set("MOSAICO.ROUTING_SCAN_MAX_CHARS", len(PR_URL))
+            assert dispatch._find_pr_url(PR_URL + " ") == PR_URL
+            settings.set("MOSAICO.ROUTING_SCAN_MAX_CHARS", 6)
+            assert _explicit_verb("reviewer") is None
+            assert _explicit_verb("review please") == "review"
+            assert _explicit_verb("      describe") is None
+        finally:
+            settings.set("MOSAICO.ROUTING_SCAN_MAX_CHARS", old)
+
+    @pytest.mark.asyncio
+    async def test_detection_budget_does_not_truncate_supplied_diff(self, monkeypatch, restore_settings):
+        large = SAMPLE_RAW_DIFF + "+" + "x" * 70000 + "\n"
+        captured = []
+
+        async def run_diff(body, verb, question, title, empty_ok=True):
+            captured.append((body, verb))
+            return dispatch.RouteResult("reviewed", True)
+
+        monkeypatch.setattr(dispatch, "_run_on_diff", run_diff)
+        result = await route_and_run_result(large + "\nNow describe it")
+        assert result.ok
+        assert captured == [(large + "\nNow describe it", "describe")]

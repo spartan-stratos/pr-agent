@@ -1,3 +1,4 @@
+import functools
 import json
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -6,6 +7,7 @@ from urllib.parse import quote, urlparse
 import giteapy
 from giteapy.rest import ApiException
 
+from pr_agent.agent.request_policy import policy_metadata, policy_value
 from pr_agent.algo.file_filter import filter_ignored
 from pr_agent.algo.git_patch_processing import decode_if_bytes
 from pr_agent.algo.language_handler import is_valid_file
@@ -19,9 +21,12 @@ from pr_agent.git_providers.git_provider import (
     GitProvider,
     IncompleteProviderPullRequestFilesError,
     IncrementalPR,
+    cache_languages,
     redact_credentials,
 )
+from pr_agent.git_providers.request_timeout import get_http_request_timeout
 from pr_agent.log import get_logger
+from pr_agent.mosaico.diff_provider import parse_unified_diff
 
 # Shipped default for the [gitea] url setting in configuration.toml. A value
 # equal to this must be treated as "unset" when resolving the user-facing base
@@ -49,9 +54,34 @@ class _GiteaCommitAdapter:
         raw = raw or {}
         self.sha = raw.get("sha", "")
         self.html_url = raw.get("html_url", "")
+        commit = raw.get("commit")
+        message = commit.get("message") if isinstance(commit, Mapping) else None
+        self.message = message if isinstance(message, str) and message.strip() else ""
+
+
+def _with_default_request_timeout(call_api):
+    """Fill in connect/read bounds when giteapy forwards an unset request timeout."""
+    @functools.wraps(call_api)
+    def call_api_with_timeout(*args, **kwargs):
+        if not kwargs.get("_request_timeout"):
+            kwargs["_request_timeout"] = (get_http_request_timeout(),) * 2
+        return call_api(*args, **kwargs)
+
+    return call_api_with_timeout
 
 
 class GiteaProvider(GitProvider):
+    def get_request_policy_metadata(self, required_fields: set[str]) -> dict:
+        pr = self.pr
+        if pr is None:
+            return policy_metadata(title="", sender="", repo_full_name=f"{self.owner}/{self.repo}",
+                                   source_branch="", target_branch="")
+        return policy_metadata(title=pr.title, sender=policy_value(pr, "user", "login"),
+                               repo_full_name=f"{self.owner}/{self.repo}",
+                               source_branch=policy_value(pr, "head", "ref"),
+                               target_branch=policy_value(pr, "base", "ref"),
+                               labels=self.get_pr_labels() if "labels" in required_fields else ())
+
     _base_url_html: Optional[str] = None  # resolved on first use, see base_url_html
 
     def __init__(self, url: Optional[str] = None):
@@ -83,6 +113,7 @@ class GiteaProvider(GitProvider):
         configuration.ssl_ca_cert = get_settings().get("GITEA.SSL_CA_CERT", None)
 
         client = giteapy.ApiClient(configuration)
+        client.call_api = _with_default_request_timeout(client.call_api)
         self.repo_api = RepoApi(client)
         self.owner = None
         self.repo = None
@@ -218,35 +249,30 @@ class GiteaProvider(GitProvider):
                     pr_number=self.pr_number
             )
 
-            lines = diff_contents.splitlines()
-            current_file = None
-            current_patch = []
-            file_patches = {}
-            for line in lines:
-                if line.startswith('diff --git'):
-                    if current_file and current_patch:
-                        file_patches[current_file] = '\n'.join(current_patch)
-                        current_patch = []
-                    current_file = line.split(' b/')[-1]
-                elif line.startswith('@@') and not current_patch:
-                    current_patch = [line]
-                elif current_patch:
-                    current_patch.append(line)
-
-            if current_file and current_patch:
-                file_patches[current_file] = '\n'.join(current_patch)
-
-            self.file_diffs = file_patches
+            self.file_diffs = {f.filename: f.patch for f in parse_unified_diff(diff_contents)}
         except Exception as e:
             self.logger.error(f"Error getting diff content: {str(e)}")
 
+    @staticmethod
+    def _url_path_parts(url: str) -> list[str]:
+        """Split a PR or issue URL into path parts that start at the owner.
+
+        Strip the install path of the configured ``GITEA.URL`` or ``GITEA.WEB_URL`` first,
+        so an instance served under a subpath (``https://host/gitea/owner/repo/pulls/1``)
+        parses like a root install, then strip the ``/api/v1/repos`` API prefix.
+        """
+        path = urlparse(url).path
+        for base_url in (get_settings().get("GITEA.URL", ""), get_settings().get("GITEA.WEB_URL", "")):
+            base_path = urlparse(base_url or "").path.rstrip("/")
+            if base_path and path.startswith(base_path + "/"):
+                path = path[len(base_path):]
+                break
+        if path.startswith("/api/v1/repos"):
+            path = path[len("/api/v1/repos"):]
+        return path.strip('/').split('/')
+
     def _parse_pr_url(self, pr_url: str) -> Tuple[str, str, int]:
-        parsed_url = urlparse(pr_url)
-
-        if parsed_url.path.startswith("/api/v1/repos"):
-            parsed_url = urlparse(pr_url.replace("/api/v1/repos", ""))
-
-        path_parts = parsed_url.path.strip('/').split('/')
+        path_parts = self._url_path_parts(pr_url)
         if len(path_parts) < 4 or path_parts[2] != 'pulls':
             raise ValueError("The provided URL does not appear to be a Gitea PR URL")
 
@@ -261,12 +287,7 @@ class GiteaProvider(GitProvider):
         return owner, repo, pr_number
 
     def _parse_issue_url(self, issue_url: str) -> Tuple[str, str, int]:
-        parsed_url = urlparse(issue_url)
-
-        if parsed_url.path.startswith("/api/v1/repos"):
-            parsed_url = urlparse(issue_url.replace("/api/v1/repos", ""))
-
-        path_parts = parsed_url.path.strip('/').split('/')
+        path_parts = self._url_path_parts(issue_url)
         if len(path_parts) < 4 or path_parts[2] != 'issues':
             raise ValueError("The provided URL does not appear to be a Gitea issue URL")
 
@@ -522,18 +543,12 @@ class GiteaProvider(GitProvider):
     def get_commit_messages(self)-> str:
         """Get commit messages for the PR"""
         max_tokens = get_settings().get("CONFIG.MAX_COMMITS_TOKENS", None)
-        pr_commits = self.repo_api.get_pr_commits(
-            owner=self.owner,
-            repo=self.repo,
-            pr_number=self.pr_number
-        )
-
-        if not pr_commits:
+        if not self.pr_commits:
             self.logger.error("Failed to get commit messages")
             return ""
 
         try:
-            commit_messages = [commit["commit"]["message"] for commit in pr_commits if commit]
+            commit_messages = [commit.message for commit in reversed(self.pr_commits) if commit.message]
 
             if not commit_messages:
                 self.logger.error("No commit messages found")
@@ -605,18 +620,21 @@ class GiteaProvider(GitProvider):
                 self.__add_file_content(filename)
                 head_file = self.file_contents.get(filename,"")
 
+            status = file.get("status","")
+
             if self.incremental.is_incremental and self.unreviewed_files_map:
                 base_file = self._get_file_content_from_latest_commit(filename)
                 self.unreviewed_files_map[filename] = patch
             else:
-                if avoid_load:
+                # An added file cannot exist at base_sha, so fetching it there only costs a
+                # request and logs an error. Matches GithubProvider.get_diff_files().
+                if avoid_load or status == 'added':
                     base_file = ""
                 else:
                     base_file = self._get_file_content_from_base(filename)
 
             num_plus_lines = file.get("additions",0)
             num_minus_lines = file.get("deletions",0)
-            status = file.get("status","")
 
             if status == 'added':
                 edit_type = EDIT_TYPE.ADDED
@@ -668,7 +686,7 @@ class GiteaProvider(GitProvider):
         try:
             pr_id = f"{self.repo}/{self.pr_number}"
             return pr_id
-        except:
+        except AttributeError:
             return ""
 
     def _get_changed_files(self) -> List[Dict[str, Any]]:
@@ -707,6 +725,7 @@ class GiteaProvider(GitProvider):
 
         return comments
 
+    @cache_languages
     def get_languages(self) -> Set[str]:
         """Get programming languages used in the repository"""
         languages = self.repo_api.get_languages(
@@ -766,10 +785,15 @@ class GiteaProvider(GitProvider):
             self.logger.error("Repository settings not found")
             return settings_files if settings_files else ""
 
+        target_ref = self.base_sha or self.base_ref
+        if not target_ref:
+            self.logger.warning("Cannot get repository settings: no target/base ref available")
+            return settings_files if settings_files else ""
+
         response = self.repo_api.get_file_content(
             owner=self.owner,
             repo=self.repo,
-            commit_sha=self.sha,
+            commit_sha=target_ref,
             filepath=self.repo_settings
         )
         if not response:
@@ -789,17 +813,17 @@ class GiteaProvider(GitProvider):
     def _get_global_settings_cache_key(self, owner: str) -> str:
         return f"gitea:{getattr(self, 'base_url', '')}:{owner}"
 
-    def _fetch_global_repo_settings(self, owner):
-        # Owner-wide global settings live in an <owner>/pr-agent-settings repository.
+    def _fetch_global_repo_settings(self, owner, settings_repo):
+        # Owner-wide global settings live in the configured <owner>/<settings_repo> repository.
         # A missing settings repo/file (404) is an expected fallback -> return "" (cached).
         try:
-            settings_repo = self.repo_api.repo_get(owner, "pr-agent-settings")
-            default_branch = getattr(settings_repo, "default_branch", None)
+            repo = self.repo_api.repo_get(owner, settings_repo)
+            default_branch = getattr(repo, "default_branch", None)
             if not default_branch:
                 return ""
             content = self.repo_api.get_file_content(
                 owner=owner,
-                repo="pr-agent-settings",
+                repo=settings_repo,
                 commit_sha=default_branch,
                 filepath=".pr_agent.toml",
             )

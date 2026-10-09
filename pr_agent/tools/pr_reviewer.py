@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
+from pr_agent.algo.artifacts import get_artifact_context
 from pr_agent.algo.comment_identity import (
     PRReviewHeader,
     PRReviewIdentity,
@@ -18,12 +19,14 @@ from pr_agent.algo.comment_identity import (
     render_hidden_marker,
 )
 from pr_agent.algo.inline_comment_dedup import (
+    KEY_ISSUE_LOCATION_MARKER_RE,
     InlineCommentStore,
     can_verify_inline_comment_publication,
     get_inline_comment_store,
     key_issue_body_with_markers,
     key_issue_fingerprint,
     key_issue_location_fingerprint,
+    strip_markers,
 )
 from pr_agent.algo.output_models import PRReview
 from pr_agent.algo.pr_processing import (
@@ -65,6 +68,7 @@ from pr_agent.algo.utils import (
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import get_git_provider_with_context
 from pr_agent.git_providers.git_provider import (
+    DISCUSSION_CONTEXT_MAX_MESSAGE_CHARS,
     GitProvider,
     IncompleteProviderPullRequestFilesError,
     IncrementalPR,
@@ -248,6 +252,7 @@ class PRReviewer:
             'question_str': question_str,
             'answer_str': answer_str,
             "extra_instructions": get_settings().pr_reviewer.extra_instructions,
+            "artifact_context": get_artifact_context("pr_reviewer"),
             "skills_context": get_skills_context(),
             "repo_context": build_repo_context(self.git_provider),
             "previous_findings": previous_findings,
@@ -500,6 +505,7 @@ class PRReviewer:
                 review_failed
                 and not isinstance(review_error, IncompleteProviderPullRequestFilesError)
                 and get_settings().config.publish_output
+                and _as_bool(get_settings().pr_reviewer.get("publish_review_failure_comment", True))
                 and (
                     persistent_write_failed
                     or not get_settings().config.get("is_auto_command", False)
@@ -675,7 +681,30 @@ class PRReviewer:
         parsed = self._load_review_finding_state()
         if parsed is None or not parsed.valid:
             return ""
-        return render_previous_findings(parsed.state, max_chars)
+        return render_previous_findings(parsed.state, max_chars, self._load_dismissed_key_issues())
+
+    def _load_dismissed_key_issues(self) -> list[dict]:
+        """Return the inline key issues whose thread someone other than PR-Agent resolved, newest first.
+
+        Only threads PR-Agent verifiably opened count, so a provider that cannot tell who resolved a thread
+        (or reports no threads) adds nothing.
+        """
+        dismissed = []
+        try:
+            for thread in self.git_provider._iter_code_suggestion_threads():
+                if (thread.status != "resolved" or thread.authored_by_agent is not True
+                        or not KEY_ISSUE_LOCATION_MARKER_RE.search(thread.suggestion)):
+                    continue
+                finding = {"path": thread.file, "body": strip_markers(thread.suggestion).strip(),
+                           "line_start": thread.start_line, "line_end": thread.end_line}
+                replies = thread.text_replies()
+                if replies:
+                    finding["reply"] = replies[-1][1][:DISCUSSION_CONTEXT_MAX_MESSAGE_CHARS]
+                dismissed.append(finding)
+        except Exception as e:
+            get_logger().warning(f"Could not read resolved key-issue threads, error: {e}")
+            return []
+        return dismissed
 
     @staticmethod
     def _review_finding_from_issue(issue: dict) -> Optional[dict]:
@@ -926,8 +955,10 @@ class PRReviewer:
         """
         comment = getattr(self, "_progress_response", None)
         settings = get_settings()
-        if comment is None or not settings.config.get("publish_output_progress", True):
+        if not settings.config.get("publish_output_progress", True):
             return None
+        # A missing comment falls through: create() then serves the check-run sink alone,
+        # which is the only progress channel automatic commands have.
         return ChunkProgressReporter.create(
             self.git_provider,
             comment,
@@ -1188,20 +1219,21 @@ class PRReviewer:
                         first_key='review', last_key='security_concerns')
 
     def _validate_review_schema(self, data: object) -> bool:
+        is_valid = True
         try:
             PRReview.model_validate(data)
         except ValidationError as error:
-            first_error = error.errors()[0]
-            field_path = ".".join(str(part) for part in first_error.get("loc", ())) or "$"
-            value = None if first_error.get("type") == "missing" else first_error.get("input")
-            get_logger().warning(
-                "Review output failed schema validation",
-                artifact={
-                    "field": field_path,
-                    "value": value,
-                },
-            )
-            return False
+            is_valid = False
+            for err in error.errors():
+                field_path = ".".join(str(part) for part in err.get("loc", ())) or "$"
+                value = None if err.get("type") == "missing" else err.get("input")
+                get_logger().warning(
+                    "Review output failed schema validation",
+                    artifact={
+                        "field": field_path,
+                        "value": value,
+                    },
+                )
 
         if isinstance(data, dict) and isinstance(data.get("review"), dict):
             review = data["review"]
@@ -1223,12 +1255,12 @@ class PRReviewer:
             for field_name, setting_name in required_fields:
                 if not vars_.get(setting_name) or field_name in review and review[field_name] is not None:
                     continue
+                is_valid = False
                 get_logger().warning(
                     "Review output failed schema validation",
                     artifact={"field": f"review.{field_name}", "value": None},
                 )
-                return False
-        return True
+        return is_valid
 
     @classmethod
     def _load_valid_review_yaml(cls, prediction: str, *, source: str = "model response") -> dict:
@@ -1363,7 +1395,7 @@ class PRReviewer:
                     else:
                         self._review_state_preserved = True
 
-        # Emit the review to optional external sinks (stdout/file/webhook/slack); no-op unless enabled.
+        # Emit the review to optional external sinks (stdout/file/webhook/slack/telegram); no-op unless enabled.
         # publish_output gates it so a dry run makes no external calls. The "no major issues"
         # suppression deliberately does not: that only silences the PR comment.
         if get_settings().config.publish_output:

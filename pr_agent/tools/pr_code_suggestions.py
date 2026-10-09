@@ -11,6 +11,7 @@ from typing import Dict, List, Optional
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
+from pr_agent.algo.artifacts import get_artifact_context
 from pr_agent.algo.comment_identity import (
     PRCodeSuggestionsHeader,
     PRCodeSuggestionsIdentity,
@@ -296,6 +297,7 @@ class PRCodeSuggestions:
             "diff_no_line_numbers": "",  # empty diff for initial calculation
             "num_code_suggestions": num_code_suggestions,
             "extra_instructions": get_settings().pr_code_suggestions.extra_instructions,
+            "artifact_context": get_artifact_context("pr_code_suggestions"),
             "skills_context": get_skills_context(),
             "repo_context": build_repo_context(self.git_provider),
             "suggestion_discussion_context": self._load_suggestion_discussion_context(),
@@ -415,6 +417,10 @@ class PRCodeSuggestions:
                     self._progress_base_body = "Preparing suggestions..."
                     self.progress_response = self.git_provider.publish_comment(
                         self._progress_base_body, is_temporary=True)
+            elif get_settings().config.publish_output_progress:
+                # No comment was published (an automatic command publishes none); the base
+                # body still anchors the reporter's dedup, so the check-run sink alone can serve.
+                self._progress_base_body = "Preparing suggestions..."
 
             # # call the model to get the suggestions, and self-reflect on them
             # if not self.is_extended:
@@ -2010,7 +2016,11 @@ class PRCodeSuggestions:
                     for index in pending:
                         numbered, unnumbered = chunk_pairs[index]
 
-                        def render(candidate: str) -> tuple[str, str]:
+                        def render(
+                            candidate: str,
+                            numbered=numbered,
+                            attempt_budget=attempt_budget,
+                        ) -> tuple[str, str]:
                             variables = copy.deepcopy(self.vars)
                             variables["diff"] = numbered
                             variables["diff_no_line_numbers"] = candidate
@@ -2323,7 +2333,7 @@ class PRCodeSuggestions:
                     try:
                         code_snippet_link = self.git_provider.get_line_link(relevant_file, relevant_lines_start,
                                                                             relevant_lines_end)
-                    except:
+                    except (AttributeError, KeyError, ValueError):
                         code_snippet_link = ""
                     # add html table for each suggestion
 
@@ -2427,6 +2437,7 @@ class PRCodeSuggestions:
                          "diff": patches_diff,
                          'num_code_suggestions': len(suggestion_list),
                          'prev_suggestions_str': prev_suggestions_str,
+                         'extra_instructions': getattr(self, 'vars', {}).get('extra_instructions') or '',
                          "is_ai_metadata": is_ai_metadata,
                          "diff_hunk_format": render_diff_hunk_format(
                              include_line_numbers=True,

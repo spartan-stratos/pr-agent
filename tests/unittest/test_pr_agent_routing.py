@@ -45,7 +45,8 @@ async def test_gitea_review_rejects_incomplete_real_provider_inventory(monkeypat
     }.get(key, default)
     monkeypatch.setattr(gitea_module, "get_settings", lambda: settings)
     transport = Mock()
-    transport.call_api.side_effect = ApiException(status=502, reason="private/repo secret failure")
+    call_api = transport.call_api
+    call_api.side_effect = ApiException(status=502, reason="private/repo secret failure")
     monkeypatch.setattr(gitea_module.giteapy, "ApiClient", lambda _config: transport)
     monkeypatch.setattr(
         gitea_module.RepoApi, "get_pull_request", lambda *_args, **_kwargs: SimpleNamespace(
@@ -89,7 +90,7 @@ async def test_gitea_review_rejects_incomplete_real_provider_inventory(monkeypat
     assert handled is False
     model_factory.assert_not_called()
     assert len(providers) == (1 if outcome == "disabled" else 2)
-    assert transport.call_api.call_count == 1
+    assert call_api.call_count == 1
     if outcome == "disabled":
         assert published == []
     else:
@@ -112,6 +113,7 @@ def reset_response_language():
 
 
 def _patch_request_dependencies(monkeypatch, validate_result=(True, None), update_settings_fn=None):
+    monkeypatch.setattr(pr_agent_module, "enforce_request_policy", lambda _url: None)
     if update_settings_fn is None:
         update_settings_fn = _identity_args
 
@@ -212,8 +214,8 @@ async def test_prepared_override_wins_after_repo_settings_and_next_command_reloa
         async def run(self):
             observed.append(get_settings().get("PR_REVIEWER.EXTRA_INSTRUCTIONS"))
 
+    monkeypatch.setattr(pr_agent_module, "enforce_request_policy", lambda _url: None)
     monkeypatch.setattr(provider_utils, "get_git_provider_with_context", lambda _url: provider)
-    monkeypatch.setattr(pr_agent_module, "reapply_artifact_context", lambda: None)
     monkeypatch.setattr(pr_agent_module, "flush_telemetry", lambda: None)
     monkeypatch.setitem(pr_agent_module.command2class, "review", FakeReview)
 
@@ -257,8 +259,8 @@ async def test_prepared_overrides_control_repository_loading(monkeypatch, settin
                              settings.pr_reviewer.require_tests_review,
                              settings.pr_reviewer.extra_instructions))
 
+    monkeypatch.setattr(pr_agent_module, "enforce_request_policy", lambda _url: None)
     monkeypatch.setattr(provider_utils, "get_git_provider_with_context", lambda _url: provider)
-    monkeypatch.setattr(pr_agent_module, "reapply_artifact_context", lambda: None)
     monkeypatch.setattr(pr_agent_module, "flush_telemetry", lambda: None)
     monkeypatch.setitem(pr_agent_module.command2class, "review", FakeReview)
 
@@ -799,18 +801,25 @@ async def test_handle_request_auto_review_uses_reviewer_auto_mode(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_auto_review_reapplies_prepared_artifact_without_notifying(monkeypatch, tmp_path):
+async def test_auto_review_keeps_prepared_artifact_context_without_notifying(monkeypatch, tmp_path):
     artifact = tmp_path / "artifact.txt"
     artifact.write_text("AUTO_REVIEW_ARTIFACT", encoding="utf-8")
     settings = get_settings()
     original_artifacts = settings.get("ARTIFACTS")
     original_instructions = settings.pr_reviewer.extra_instructions
+    artifact_token = artifacts._artifact_context.set(None)
     observed = []
     notify = Mock()
 
     class FakeReviewer:
         def __init__(self, _pr_url, is_answer=False, is_auto=False, args=None, ai_handler=None):
-            observed.append((is_answer, is_auto, args, str(settings.pr_reviewer.extra_instructions)))
+            observed.append((
+                is_answer,
+                is_auto,
+                args,
+                str(settings.pr_reviewer.extra_instructions),
+                artifacts.get_artifact_context("pr_reviewer"),
+            ))
 
         async def run(self):
             return None
@@ -840,15 +849,17 @@ async def test_auto_review_reapplies_prepared_artifact_without_notifying(monkeyp
         )
 
         assert handled is True
-        assert [(is_answer, is_auto, args) for is_answer, is_auto, args, _text in observed] == [
+        assert [(is_answer, is_auto, args) for is_answer, is_auto, args, _text, _context in observed] == [
             (False, True, ["--kept"])
         ]
         assert observed[0][3].startswith("Repository instructions")
-        assert observed[0][3].count("AUTO_REVIEW_ARTIFACT") == 1
+        assert observed[0][3].count("AUTO_REVIEW_ARTIFACT") == 0
+        assert observed[0][4]["content"] == "AUTO_REVIEW_ARTIFACT"
         notify.assert_not_called()
     finally:
         settings.set("ARTIFACTS", original_artifacts, merge=False)
         settings.set("PR_REVIEWER.EXTRA_INSTRUCTIONS", original_instructions)
+        artifacts._artifact_context.reset(artifact_token)
 
 
 @pytest.mark.asyncio
@@ -871,13 +882,15 @@ async def test_unscoped_dispatcher_does_not_load_artifact_or_change_instructions
     try:
         settings.set("PR_REVIEWER.EXTRA_INSTRUCTIONS", "Unscoped instructions")
         _patch_request_dependencies(monkeypatch)
-        monkeypatch.setattr(artifacts, "load_artifact", fail_if_loaded)
+        monkeypatch.setattr(artifacts, "load_artifact_context", fail_if_loaded)
+        monkeypatch.setattr(artifacts, "_read_and_truncate", fail_if_loaded)
         monkeypatch.setitem(pr_agent_module.command2class, "review", FakeTool)
 
         handled = await pr_agent_module.PRAgent()._handle_request("https://example/pr/1", "/review")
 
         assert handled is True
         assert observed == ["Unscoped instructions"]
+        assert artifacts.get_artifact_context("pr_reviewer") is None
     finally:
         settings.set("PR_REVIEWER.EXTRA_INSTRUCTIONS", original_instructions)
         artifacts._artifact_context.reset(token)

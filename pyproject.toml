@@ -38,7 +38,7 @@ dependencies = [
   "GitPython>=3.1.62,<4",
   "starlette>=1.6.0,<2",
   "Jinja2==3.1.6",
-  "litellm==1.103.0",
+  "litellm==1.104.0",
   "loguru==0.7.3",
   "openai>=1.55.3",
   "PyJWT>=2.15.1,<3",
@@ -156,9 +156,8 @@ dev = [
 ]
 
 [tool.uv]
-# Keep this exact pin in sync with docker/Dockerfile and docker/Dockerfile.lambda
-# so local, CI, release, and container builds use the same uv version.
-required-version = "==0.12.10"
+# Floor, not "==": Dependabot's uv 0.12.18 failed the exact pin with tool_version_not_supported.
+required-version = ">=0.12.10"
 
 [tool.ruff]
 line-length = 120
@@ -176,20 +175,8 @@ lint.fixable = [
   "F541", # f-string without placeholders
 ]
 
-lint.unfixable = [
-  "B", # Avoid trying to fix flake8-bugbear (`B`) violations.
-]
-
 lint.exclude = ["api/code_completions"]
 
-# Everything below is a pre-existing
-# violation deferred so ruff runs green on adoption — fix the code and drop
-# the entry. TODO: burn this list down.
-lint.ignore = [
-  "E722", # bare `except`
-  "B023", # function definition uses loop variable
-  "B904", # raise without `from` inside `except`
-]
 
 [tool.ruff.lint.per-file-ignores]
 # Ignore import-position and unused-import in __init__.py (re-export modules).

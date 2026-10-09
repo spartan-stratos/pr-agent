@@ -41,7 +41,9 @@ except ImportError:
 from pr_agent.algo import (
     CLAUDE_EXTENDED_THINKING_MODELS,
     GPT6_MODELS,
+    GPT6_MODELS_WITHOUT_NONE_EFFORT,
     GPT6_OPENROUTER_ROUTING_SUFFIXES,
+    GPT6_SOL_TIER_MODELS,
     GROK_REASONING_EFFORT_LEVELS,
     STREAMING_REQUIRED_MODELS,
     USER_MESSAGE_ONLY_MODELS,
@@ -139,10 +141,12 @@ from pr_agent.algo.run_details import _as_decimal_cost, record_ai_call
 from pr_agent.algo.run_output import get_version
 from pr_agent.algo.url_safety import with_safe_redirects
 from pr_agent.algo.utils import ReasoningEffort
-from pr_agent.config_loader import get_settings, get_verbosity_level
+from pr_agent.config_loader import get_settings, get_verbosity_level, global_settings
 from pr_agent.log import get_logger
 
 MODEL_RETRIES = 2
+# Lowest config.max_output_tokens honored; Bedrock Claude with thinking needs this much to answer.
+MIN_MAX_OUTPUT_TOKENS = 4096
 _IMAGE_HEAD_TIMEOUT_SECONDS = 5
 _IMAGE_NOT_ALIVE_MESSAGE = (
     "The image link is not [alive](img_path).\n"
@@ -490,12 +494,11 @@ class LiteLLMAIHandler(BaseAiHandler):
         ).strip().lower()
         self._anthropic_auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
         self._request_provider_cache = {}
+        self._drop_params = settings.get("LITELLM.DROP_PARAMS", None)
 
-        if settings.get("LITELLM.DISABLE_AIOHTTP", False):
+        if global_settings.get("LITELLM.DISABLE_AIOHTTP", False):
             litellm.disable_aiohttp_transport = True
         self._initialize_aws_request_credentials(settings)
-        if settings.get("LITELLM.DROP_PARAMS", None):
-            litellm.drop_params = settings.litellm.drop_params
         if settings.get("LITELLM.SUCCESS_CALLBACK", None):
             litellm.success_callback = settings.litellm.success_callback
         if settings.get("LITELLM.FAILURE_CALLBACK", None):
@@ -584,13 +587,10 @@ class LiteLLMAIHandler(BaseAiHandler):
         )
         bedrock_overrides = [
             model
-            for model in self.claude_adaptive_thinking_models_override
+            for model in self._validated_model_name_list("claude_adaptive_thinking_models_override", global_settings)
             if model.startswith("bedrock/") or re.match(r"^arn:[^:]+:bedrock:", model)
         ]
-        if (
-            bedrock_overrides
-            and self._claude_thinking_controls["enable_claude_adaptive_thinking"]
-        ):
+        if bedrock_overrides and global_settings.config.get("enable_claude_adaptive_thinking", False):
             litellm.register_model({
                 model: {
                     "litellm_provider": "bedrock",
@@ -1344,7 +1344,7 @@ class LiteLLMAIHandler(BaseAiHandler):
         """Return the supported native GPT-6 model name without changing gateway model IDs."""
         if model.startswith(("azure_ai/", "aiohttp_openai/")):
             provider_model = model.split("/", 1)[1].removesuffix("_thinking")
-            return provider_model if provider_model in ("gpt-6-sol", "gpt-6-luna") else None
+            return provider_model if provider_model in GPT6_SOL_TIER_MODELS else None
         model = _strip_openai_azure_prefixes(model).removesuffix("_thinking")
         return model if model in GPT6_MODELS else None
 
@@ -1355,7 +1355,7 @@ class LiteLLMAIHandler(BaseAiHandler):
             return "max_tokens"
         if (
             provider not in (None, "openai", "azure", "azure_ai", "openrouter")
-            and cls._gpt6_model_name(model) in ("gpt-6-sol", "gpt-6-luna")
+            and cls._gpt6_model_name(model) in GPT6_SOL_TIER_MODELS
         ):
             return "max_tokens"
         if model.startswith("openrouter/"):
@@ -1380,7 +1380,7 @@ class LiteLLMAIHandler(BaseAiHandler):
                 routed_model = routed_model.rsplit(":", 1)[0]
             gpt6_model = self._gpt6_model_name(routed_model)
             if gpt6_model:
-                if custom_llm_provider not in ("", "openrouter") and gpt6_model in ("gpt-6-sol", "gpt-6-luna"):
+                if custom_llm_provider not in ("", "openrouter") and gpt6_model in GPT6_SOL_TIER_MODELS:
                     return model
                 return model.replace("_thinking", "", 1)
             if model.startswith("openrouter/"):
@@ -1390,11 +1390,11 @@ class LiteLLMAIHandler(BaseAiHandler):
             or self._resolve_configured_request_provider(model, custom_llm_provider) not in (
                 "openai", "azure", "azure_ai"
             )
-        ) and self._gpt6_model_name(model) in ("gpt-6-sol", "gpt-6-luna"):
+        ) and self._gpt6_model_name(model) in GPT6_SOL_TIER_MODELS:
             return model
         if (
             model.startswith(("azure_ai/", "aiohttp_openai/"))
-            and self._gpt6_model_name(model) in ("gpt-6-sol", "gpt-6-luna")
+            and self._gpt6_model_name(model) in GPT6_SOL_TIER_MODELS
         ):
             return model.replace("_thinking", "")
         model_base = _strip_openai_azure_prefixes(model)
@@ -2022,6 +2022,59 @@ class LiteLLMAIHandler(BaseAiHandler):
         )
 
     @classmethod
+    def _clamp_openrouter_reasoning_effort(
+        cls, model: str, reasoning_effort: str, reasoning_max_tokens: int = 0
+    ) -> str:
+        """Apply every OpenRouter-side reasoning-effort clamp and return the level requested.
+
+        Both the request builder and get_output_token_reserve route through this, so a clamp
+        added for one model family cannot be missing from the output-token reserve and leave
+        it disagreeing with the reasoning object actually sent.
+        """
+        if not reasoning_effort:
+            return reasoning_effort
+
+        if reasoning_effort == ReasoningEffort.MINIMAL.value and reasoning_max_tokens <= 0:
+            # Every GPT-6 model page omits "minimal", so PR-Agent corrects an explicit
+            # "minimal" to "low". A positive budget still takes precedence below, which is why
+            # this is skipped when one is configured.
+            gpt6_model = model.removeprefix("openrouter/")
+            if gpt6_model.endswith(GPT6_OPENROUTER_ROUTING_SUFFIXES):
+                gpt6_model = gpt6_model.rsplit(":", 1)[0]
+            if cls._gpt6_model_name(gpt6_model) in GPT6_MODELS:
+                get_logger().info(
+                    f"{model} does not support reasoning_effort='minimal'; using 'low' instead."
+                )
+                reasoning_effort = ReasoningEffort.LOW.value
+
+        if reasoning_effort == ReasoningEffort.NONE.value:
+            # The pages of GPT6_MODELS_WITHOUT_NONE_EFFORT members omit "none", so PR-Agent
+            # corrects an explicit "none" to "low". That branch would otherwise be reached
+            # ahead of the token budget and win, discarding the budget, so correcting the value
+            # is what lets a configured budget apply. Clamp regardless of budget.
+            gpt6_model = model.removeprefix("openrouter/")
+            if gpt6_model.endswith(GPT6_OPENROUTER_ROUTING_SUFFIXES):
+                gpt6_model = gpt6_model.rsplit(":", 1)[0]
+            if cls._gpt6_model_name(gpt6_model) in GPT6_MODELS_WITHOUT_NONE_EFFORT:
+                get_logger().info(
+                    f"{model} does not support reasoning_effort='none'; using 'low' instead."
+                )
+                reasoning_effort = ReasoningEffort.LOW.value
+
+        clamped_effort = cls._clamp_grok_reasoning_effort(model, reasoning_effort)
+        if clamped_effort != reasoning_effort:
+            get_logger().info(
+                f"Grok model {model} does not support reasoning_effort="
+                f"'{reasoning_effort}'; using '{clamped_effort}' instead."
+            )
+            reasoning_effort = clamped_effort
+
+        if reasoning_effort == "none" and cls._uses_gemini_low_reasoning_floor(model):
+            get_logger().info(f"Gemini model {model} does not support reasoning_effort='none'; using 'low' instead.")
+            reasoning_effort = "low"
+        return reasoning_effort
+
+    @classmethod
     def _clamp_grok_reasoning_effort(cls, model: str, reasoning_effort: str) -> str:
         """Clamp a configured reasoning effort to the closest supported Grok level."""
         grok_levels = cls._grok_reasoning_levels_for(model)
@@ -2114,23 +2167,9 @@ class LiteLLMAIHandler(BaseAiHandler):
                 effective_reasoning_effort = inherited_reasoning_effort or ""
 
         if effective_reasoning_effort:
-            if effective_reasoning_effort == ReasoningEffort.MINIMAL.value and reasoning_max_tokens <= 0:
-                gpt6_model = model.removeprefix("openrouter/")
-                if gpt6_model.endswith(GPT6_OPENROUTER_ROUTING_SUFFIXES):
-                    gpt6_model = gpt6_model.rsplit(":", 1)[0]
-                if self._gpt6_model_name(gpt6_model) in ("gpt-6-sol", "gpt-6-luna"):
-                    effective_reasoning_effort = ReasoningEffort.LOW.value
-            clamped_effort = self._clamp_grok_reasoning_effort(model, effective_reasoning_effort)
-            if clamped_effort != effective_reasoning_effort:
-                get_logger().info(
-                    f"Grok model {model} does not support reasoning_effort="
-                    f"'{effective_reasoning_effort}'; using '{clamped_effort}' instead."
-                )
-                effective_reasoning_effort = clamped_effort
-
-        if effective_reasoning_effort == "none" and self._uses_gemini_low_reasoning_floor(model):
-            get_logger().info(f"Gemini model {model} does not support reasoning_effort='none'; using 'low' instead.")
-            effective_reasoning_effort = "low"
+            effective_reasoning_effort = self._clamp_openrouter_reasoning_effort(
+                model, effective_reasoning_effort, reasoning_max_tokens
+            )
 
         # Preserve explicit disablement; otherwise keep effort and max_tokens
         # mutually exclusive by preferring the token budget.
@@ -2226,11 +2265,33 @@ class LiteLLMAIHandler(BaseAiHandler):
             )
         return extended_thinking_budget_tokens, extended_thinking_max_output_tokens
 
+    @classmethod
+    def _configured_max_output_tokens(cls) -> int:
+        """Return config.max_output_tokens, warning about values that would unset or undercut the cap."""
+        value = get_settings().config.get("max_output_tokens", 0)
+        output_tokens = cls._coerce_token_value(value)
+        if value is None or value is False or value == 0 or str(value).strip() in ("", "0"):
+            return 0
+        if output_tokens == 0:
+            get_logger().warning(f"Ignoring invalid config.max_output_tokens: {value!r}")
+            return 0
+        if output_tokens < 0:
+            get_logger().warning(f"Ignoring negative config.max_output_tokens: {output_tokens}")
+            return 0
+        if output_tokens < MIN_MAX_OUTPUT_TOKENS:
+            get_logger().warning(
+                f"Raising config.max_output_tokens from {output_tokens} to {MIN_MAX_OUTPUT_TOKENS}: "
+                f"smaller caps can leave no room for the answer when reasoning is enabled"
+            )
+            return MIN_MAX_OUTPUT_TOKENS
+        return output_tokens
+
     def _resolve_output_token_limit(self, model: str, openrouter_model: str | None) -> int:
         """Return the final positive output cap selected by PR-Agent request controls."""
-        output_tokens = self._coerce_token_value(get_settings().config.get("max_output_tokens", 0))
         if self._claude_thinking_mode(model) == "extended":
             _, output_tokens = self._get_claude_extended_thinking_limits()
+        else:
+            output_tokens = self._configured_max_output_tokens()
 
         if openrouter_model:
             openrouter_output_tokens = self._coerce_token_value(self._openrouter_controls.get("max_tokens", 0))
@@ -2268,16 +2329,15 @@ class LiteLLMAIHandler(BaseAiHandler):
         if not openrouter_model:
             return default_output_tokens
 
-        reasoning_effort = str(
-            self._openrouter_controls.get("reasoning_effort", "") or ""
-        ).strip().lower()
-        reasoning_effort = self._clamp_grok_reasoning_effort(
-            openrouter_model, reasoning_effort
-        )
-        if reasoning_effort == "none" and self._uses_gemini_low_reasoning_floor(openrouter_model):
-            reasoning_effort = "low"
         reasoning_tokens = self._coerce_token_value(
             self._openrouter_controls.get("reasoning_max_tokens", 0)
+        )
+        # Route through the same clamp the request builder uses: if that request will send a
+        # reasoning token budget, this reserve has to account for it.
+        reasoning_effort = self._clamp_openrouter_reasoning_effort(
+            openrouter_model,
+            str(self._openrouter_controls.get("reasoning_effort", "") or "").strip().lower(),
+            reasoning_tokens,
         )
         if reasoning_effort == "none" or reasoning_tokens <= 0:
             return default_output_tokens
@@ -2365,9 +2425,9 @@ class LiteLLMAIHandler(BaseAiHandler):
         return kwargs
 
     @staticmethod
-    def _validated_model_name_list(setting_name: str) -> list[str]:
+    def _validated_model_name_list(setting_name: str, settings=None) -> list[str]:
         """Return a stripped config list of model names, or an empty list when malformed."""
-        value = get_settings().config.get(setting_name, []) or []
+        value = (settings or get_settings()).config.get(setting_name, []) or []
         if not value:
             return []
         if not isinstance(value, list) or not all(
@@ -2743,14 +2803,14 @@ class LiteLLMAIHandler(BaseAiHandler):
                 gpt6_model = self._gpt6_model_name(family_model.removeprefix("openrouter/"))
                 preserved_gpt6_alias = (
                     bool(openrouter_model) and family_model.endswith("_thinking")
-                    and gpt6_model in ("gpt-6-sol", "gpt-6-luna")
+                    and gpt6_model in GPT6_SOL_TIER_MODELS
                 )
                 non_native_gpt6_model = (
                     (request_provider not in ("openai", "azure", "azure_ai", "openrouter")
                      or custom_llm_provider in ("azure_text", "text-completion-openai")
                      or family_model.startswith(("azure_text/", "text-completion-openai/")))
                     and (gpt6_model or family_model.rsplit("/", 1)[-1].removesuffix("_thinking"))
-                    in ("gpt-6-sol", "gpt-6-luna")
+                    in GPT6_SOL_TIER_MODELS
                 )
                 if non_native_gpt6_model or preserved_gpt6_alias:
                     gpt6_model = None
@@ -2765,13 +2825,13 @@ class LiteLLMAIHandler(BaseAiHandler):
 
                     if is_gpt6_model and (
                         effort == ReasoningEffort.MINIMAL.value
-                        or (gpt6_model == "gpt-6-astra" and effort == ReasoningEffort.NONE.value)
+                        or (gpt6_model in GPT6_MODELS_WITHOUT_NONE_EFFORT and effort == ReasoningEffort.NONE.value)
                     ):
                         get_logger().info(
                             f"{gpt6_model} does not support reasoning_effort='{effort}'; using 'low'"
                         )
                         effort = ReasoningEffort.LOW.value
-                    elif gpt6_model in ("gpt-6-sol", "gpt-6-luna") and request_provider in ("azure", "azure_ai") and (
+                    elif gpt6_model in GPT6_SOL_TIER_MODELS and request_provider in ("azure", "azure_ai") and (
                         effort == ReasoningEffort.MAX.value
                     ):
                         get_logger().info(f"{gpt6_model} on Azure Chat Completions uses 'xhigh' instead of 'max'")
@@ -2828,7 +2888,7 @@ class LiteLLMAIHandler(BaseAiHandler):
 
                     if openrouter_model:
                         openrouter_reasoning_effort = effort
-                    elif gpt6_model in ("gpt-6-sol", "gpt-6-luna") and (
+                    elif gpt6_model in GPT6_SOL_TIER_MODELS and (
                         effort == ReasoningEffort.XHIGH.value
                         or (request_provider in ("azure", "azure_ai") and effort == ReasoningEffort.NONE.value)
                     ):
@@ -3273,6 +3333,8 @@ class LiteLLMAIHandler(BaseAiHandler):
     ):
         """Call LiteLLM with any provider compatibility context scoped to this task."""
         _completion = _completion or acompletion
+        if getattr(self, "_drop_params", None):
+            kwargs.setdefault("drop_params", self._drop_params)
         custom_llm_provider = str(kwargs.get("custom_llm_provider") or "").strip().lower()
         provider = self._resolve_configured_request_provider(kwargs.get("model"), custom_llm_provider)
         transport = (
