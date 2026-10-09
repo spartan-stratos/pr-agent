@@ -118,6 +118,49 @@ New upstream additions this fork now inherits:
   `docs/docs/usage-guide/configuration_reference.md` regenerated. **This is a recurring merge cost:
   every future upstream bump to that number conflicts with the fork's +4.**
 
+## Upstream merge status (2026-10-09, upstream/main @ 82 commits)
+
+Merged `upstream/main` into `custom` (82 behind). Pre-merge snapshot kept on
+`custom-premerge-2026-10-09`. 10 fork-touched files were in the incoming diff; 8 auto-merged
+(`pr_agent.py`, `algo/__init__.py`, `config_loader.py`, `local_git_provider.py`,
+`pr_code_suggestions_reflect_prompts.toml`, `configuration.toml`, `pr_code_suggestions.py`,
+`test_local_git_provider.py`). Only the known generated-config pair conflicted.
+
+| # | Patch | Status after merge |
+|---|---|---|
+| 1 | stdout-sink dropped-suggestion recovery | Still applies. `scripts/` only. |
+| 2 | out-of-hunk inline-comment drop handling | Still applies. |
+| 3 | SIGPIPE-under-`pipefail` truncation fix | Still applies. `scripts/` only. |
+| 4 | 404-as-fake-conventions guard | Still applies. `scripts/` only. |
+| 5 | worktree `.git`-file repo-root detection | Still superseded upstream; nothing to carry. |
+| 6 | scoped clean-tree check | Still applies, byte-identical through the merge. |
+| 7 | reflect-prompt "score the defect, not the patch" | Still applies as a clean +6 insertion. Upstream #3987 (preserve extra instructions in reflection) is complementary, not a replacement - it keeps the user's extra instructions in the reflection prompt, it does not change how a suggestion is scored. |
+
+Conflict resolutions:
+
+- `tests/unittest/test_config_reference.py` - upstream's exact key count moved 282 -> 285, so the
+  fork total is 289. This is the recurring cost the 2026-10-05 entry predicted; it now has a
+  second data point. The `[claude_cli]` section is still exactly 4 keys.
+- `docs/docs/usage-guide/configuration_reference.md` - generated file. Took upstream, then re-ran
+  `uv run python scripts/generate_config_reference.py`, which wrote 289 keys across 36 sections.
+  Never hand-merge this file; regenerating is the resolution.
+
+Verification: `PYTHONPATH=. uv run pytest tests/unittest -q` -> 12646 passed, 33 skipped,
+1 xfailed, 1 failed. The failure is `test_comment_history_shares_deadline_across_pages`
+(`test_github_polling_notifications.py`) and it is **test-order pollution, not a merge
+regression**: the file passes 65/65 in isolation on the merged tree, and the single test passes in
+isolation on a clean `upstream/main` worktree. `scripts/tests` (6 passed) and
+`scripts/tests/test_review_local_coverage.sh` are green.
+
+Upstream changes worth knowing about:
+
+- `#3985` loads instruction files lazily against a line budget. That is upstream's own
+  context-packing path and does not touch the fork's conventions budget in `review-local.sh`, which
+  is assembled shell-side before PR-Agent is invoked. The two budgets are independent; if reviews
+  start losing conventions, check both.
+- `#3943` moves PR-ignore policy enforcement to the agent boundary (`pr_agent.py`), which is the
+  file carrying the fork's `get_ai_handler()` default. It auto-merged; the fork default survived.
+
 ## Migration trigger (pre-committed)
 
 The **next** bug that requires editing `pr_agent/config_loader.py` or
