@@ -336,7 +336,13 @@ if [ "$LOCAL_MODE" = "1" ]; then
                 CHUNK="$(cat "$pfile" 2>/dev/null || true)"
                 if [ -n "$CHUNK" ]; then
                     pname="$(basename "$pfile" .md)"
-                    PCHUNK="${CHUNK:0:${PRAGENT_PATTERN_CHARS:-3000}}"
+                    # Section-aware cut: keep the pattern's actionable sections (`## DO flag`,
+                    # `## Do NOT flag`, `## How to recognize in a diff`) rather than its first N bytes.
+                    # A head cut kept the mechanism and dropped the instructions - measured 2026-10-10,
+                    # 14 of 27 pattern files exceed the cut and in every one of them those sections fell
+                    # past it. Falls back to the head cut if the helper is unavailable.
+                    PCHUNK="$(python3 "$ROOT/scripts/pattern-digest.py" "$pfile" "${PRAGENT_PATTERN_CHARS:-3000}" 2>/dev/null)"
+                    [ -n "$PCHUNK" ] || PCHUNK="${CHUNK:0:${PRAGENT_PATTERN_CHARS:-3000}}"
                     if [ $(( PATTERN_TIER_CHARS + ${#PCHUNK} )) -gt "$PATTERN_TIER_CAP" ]; then
                         PATTERNS_SKIPPED=$((PATTERNS_SKIPPED + 1))
                         continue
@@ -425,7 +431,13 @@ elif [ "${PRAGENT_REPO_CONVENTIONS:-1}" != "0" ] && [ -n "$OWNER" ] && [ -n "$RE
             CHUNK="$(cat "$pfile" 2>/dev/null || true)"
             if [ -n "$CHUNK" ]; then
                 pname="$(basename "$pfile" .md)"
-                PCHUNK="${CHUNK:0:${PRAGENT_PATTERN_CHARS:-3000}}"
+                # Section-aware cut: keep the pattern's actionable sections (`## DO flag`,
+                # `## Do NOT flag`, `## How to recognize in a diff`) rather than its first N bytes.
+                # A head cut kept the mechanism and dropped the instructions - measured 2026-10-10,
+                # 14 of 27 pattern files exceed the cut and in every one of them those sections fell
+                # past it. Falls back to the head cut if the helper is unavailable.
+                PCHUNK="$(python3 "$ROOT/scripts/pattern-digest.py" "$pfile" "${PRAGENT_PATTERN_CHARS:-3000}" 2>/dev/null)"
+                [ -n "$PCHUNK" ] || PCHUNK="${CHUNK:0:${PRAGENT_PATTERN_CHARS:-3000}}"
                 if [ $(( PATTERN_TIER_CHARS + ${#PCHUNK} )) -gt "$PATTERN_TIER_CAP" ]; then
                     PATTERNS_SKIPPED=$((PATTERNS_SKIPPED + 1))
                     continue

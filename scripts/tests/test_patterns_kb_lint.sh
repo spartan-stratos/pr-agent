@@ -15,6 +15,7 @@ if [ ! -d "$ROOT" ]; then
 fi
 
 CAP="${PRAGENT_PATTERN_CHARS:-3000}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 STOPWORDS="${PRAGENT_PATTERN_STOPWORDS:-class object interface fun val var data sealed enum return if else for while when try catch throw import package public private internal true false null string int long boolean list map set get add new this that with from into and not error test tests result state guard type name value item items code line file files build}"
 
 PASS=0; FAIL=0
@@ -40,9 +41,16 @@ for f in "$ROOT"/*/*.md; do
         FAIL=$((FAIL+1)); continue
     fi
 
+    # The cut is section-aware (scripts/pattern-digest.py), so raw size no longer predicts loss.
+    # What matters is whether an ACTIONABLE section is dropped entirely at the review cap.
     size="$(wc -c < "$f" | tr -d ' ')"
-    if [ "$size" -gt $(( CAP + CAP / 2 )) ]; then
-        echo "WARN: $rel is ${size}c; the per-pattern cut is ${CAP}c, so the tail never reaches the model"
+    if [ "$size" -gt "$CAP" ]; then
+        digest="$(python3 "$REPO_ROOT/scripts/pattern-digest.py" "$f" "$CAP" 2>/dev/null || true)"
+        for want in 'Do NOT flag' "Don't flag" 'DO flag' 'How to recogni'; do
+            if grep -qi -- "^## .*$want" "$f" && ! printf '%s' "$digest" | grep -qi -- "^## .*$want"; then
+                echo "WARN: $rel is ${size}c and the ${CAP}c digest drops its '$want' section - shorten the file"
+            fi
+        done
     fi
 
     # A `repos:` line must carry at least one token, or the file is dead for every repo.
