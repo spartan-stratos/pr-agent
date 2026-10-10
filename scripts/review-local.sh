@@ -350,7 +350,13 @@ if [ "$LOCAL_MODE" = "1" ]; then
 
         # Stack rules fill whatever budget the patterns left, oldest-first per stack, and stop at
         # the cap rather than overrunning it and relying on the final truncation.
-        STACK_BUDGET=$(( ${PRAGENT_CONV_CAP:-14000} - ${#CONV} ))
+        # Leave a reserve for the workspace-index tier, which is appended after this loop. Without
+        # it the stack rules fill to within 500 of CONV_CAP and the workspace block lands ENTIRELY
+        # past the cut: measured 2026-10-10 on a service-dietfit diff, the block started at char
+        # 14121 of a 14000-char cap, so all 3527 of its characters were discarded while the summary
+        # line still reported `workspace-ctx=10 symbols, 38 call-sites`. Same shape as the patterns
+        # tier bug - a tier that reports what it SELECTED rather than what survived.
+        STACK_BUDGET=$(( ${PRAGENT_CONV_CAP:-14000} - ${#CONV} - ${PRAGENT_WORKSPACE_RESERVE:-2500} ))
         for stack in $STACKS; do
             [ "$STACK_BUDGET" -gt 500 ] || break
             [ -d "$STACKS_ROOT/$stack" ] || continue
@@ -453,16 +459,27 @@ fi
 
 # Diff-driven workspace code-context (local mode only): pull call-sites of the symbols
 # this diff changes so the reviewer sees blast radius beyond the diff. Appended AFTER the
-# rules so the 9000-char cap prioritizes conventions; code-context fills the remainder.
+# rules so conventions win the budget; code-context fills the remainder, which the stack tier now
+# reserves for it (PRAGENT_WORKSPACE_RESERVE). The old wording named a "9000-char cap" that never
+# existed on the rules tier, which is why nothing reserved anything.
 # Best-effort: never fail the review. Disable with PRAGENT_WORKSPACE_INDEX=0.
 WORKSPACE_CTX=none
 _wi_start="$(_now)"
 if [ "$LOCAL_MODE" = "1" ] && [ "${PRAGENT_WORKSPACE_INDEX:-1}" != "0" ]; then
     WI_ERR="$(mktemp)"
     if WI_OUT="$("$ROOT/scripts/workspace-index.sh" "$TARGET" 2>"$WI_ERR")" && [ -n "$WI_OUT" ]; then
-        CONV+="## workspace code context"$'\n'"$WI_OUT"$'\n'
+        # Truncate to the budget actually left, and say so. Appending past CONV_CAP is the same as
+        # not appending at all, because the final cut is head-keep.
+        WS_BUDGET=$(( ${PRAGENT_CONV_CAP:-14000} - ${#CONV} - 30 ))
         WORKSPACE_CTX="$(sed -n 's/^workspace-index: //p' "$WI_ERR" | head -1)"
         [ -n "$WORKSPACE_CTX" ] || WORKSPACE_CTX=injected
+        if [ "$WS_BUDGET" -lt 500 ]; then
+            WORKSPACE_CTX="dropped-no-budget (${#WI_OUT}c, ${WS_BUDGET}c left)"
+        else
+            WS_CHUNK="${WI_OUT:0:$WS_BUDGET}"
+            CONV+="## workspace code context"$'\n'"$WS_CHUNK"$'\n'
+            [ "${#WS_CHUNK}" -lt "${#WI_OUT}" ] && WORKSPACE_CTX="$WORKSPACE_CTX (${#WS_CHUNK}c of ${#WI_OUT}c)"
+        fi
     else
         WORKSPACE_CTX="$(sed -n 's/^workspace-index: //p' "$WI_ERR" | head -1)"
         [ -n "$WORKSPACE_CTX" ] || WORKSPACE_CTX=none
